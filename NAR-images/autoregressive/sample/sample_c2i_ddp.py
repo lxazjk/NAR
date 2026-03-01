@@ -14,10 +14,86 @@ import math
 import argparse
 
 import sys
-sys.path.append('place the absolute path of NAR-images here')
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.append(ROOT)
 from tokenizer.tokenizer_image.vq_model import VQ_models
 from autoregressive.models.gpt import GPT_models
 from autoregressive.models.generate import generate
+
+
+#################################################################################
+#                                   LoRA Utils                                 #
+#################################################################################
+class LoRALinear(torch.nn.Module):
+    def __init__(self, in_features, out_features, r=0, lora_alpha=1.0, lora_dropout=0.0, bias=True, train_base=False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.r = r
+        self.lora_alpha = lora_alpha
+        self.scaling = lora_alpha / r if r > 0 else 1.0
+        self.lora_dropout = torch.nn.Dropout(lora_dropout) if lora_dropout > 0.0 else torch.nn.Identity()
+
+        self.weight = torch.nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = torch.nn.Parameter(torch.empty(out_features))
+        else:
+            self.bias = None
+
+        if r > 0:
+            self.lora_A = torch.nn.Parameter(torch.zeros(r, in_features))
+            self.lora_B = torch.nn.Parameter(torch.zeros(out_features, r))
+            torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            torch.nn.init.zeros_(self.lora_B)
+        else:
+            self.lora_A = None
+            self.lora_B = None
+
+        if not train_base:
+            self.weight.requires_grad_(False)
+            if self.bias is not None:
+                self.bias.requires_grad_(False)
+
+    @classmethod
+    def from_linear(cls, linear, r=0, lora_alpha=1.0, lora_dropout=0.0, train_base=False):
+        # Important: create LoRA module on the same device/dtype as the original Linear.
+        # Otherwise, replacing a CUDA Linear with a CPU LoRA module will crash at runtime.
+        lora = cls(
+            linear.in_features,
+            linear.out_features,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            bias=linear.bias is not None,
+            train_base=train_base,
+        ).to(device=linear.weight.device, dtype=linear.weight.dtype)
+        with torch.no_grad():
+            lora.weight.copy_(linear.weight)
+            if linear.bias is not None:
+                lora.bias.copy_(linear.bias)
+        return lora
+
+    def forward(self, x):
+        result = torch.nn.functional.linear(x, self.weight, self.bias)
+        if self.r > 0:
+            lora_out = self.lora_dropout(x)
+            lora_out = torch.nn.functional.linear(lora_out, self.lora_A, bias=None)
+            lora_out = torch.nn.functional.linear(lora_out, self.lora_B, bias=None)
+            result = result + lora_out * self.scaling
+        return result
+
+
+def apply_lora(model, target_substrings, r, alpha, dropout, train_base):
+    def _apply(module, prefix=""):
+        for name, child in module.named_children():
+            full_name = f"{prefix}.{name}" if prefix else name
+            if isinstance(child, torch.nn.Linear) and any(t in full_name for t in target_substrings):
+                setattr(module, name, LoRALinear.from_linear(child, r=r, lora_alpha=alpha, lora_dropout=dropout, train_base=train_base))
+            else:
+                _apply(child, full_name)
+
+    _apply(model)
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -64,13 +140,8 @@ def main(args):
     # create and load gpt model
     precision = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.precision]
     latent_size = args.image_size // args.downsample_size
-    gpt_model = GPT_models[args.gpt_model](
-        vocab_size=args.codebook_size,
-        block_size=latent_size ** 2,
-        num_classes=args.num_classes,
-        cls_token_num=args.cls_token_num,
-        model_type=args.gpt_type,
-    ).to(device=device, dtype=precision)
+
+    # Load checkpoint first to auto-detect optional modules.
     checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
     if args.from_fsdp: # fsdp
         model_weight = checkpoint
@@ -82,6 +153,30 @@ def main(args):
         model_weight = checkpoint["state_dict"]
     else:
         raise Exception("please check model weight, maybe add --from-fsdp to run command")
+
+    # Auto-enable HV mix if checkpoint contains the parameter.
+    has_hv_mix = isinstance(model_weight, dict) and any(("hv_mix_logit" in k) for k in model_weight.keys())
+    if has_hv_mix and not getattr(args, "hv_mix", False):
+        args.hv_mix = True
+
+    gpt_model = GPT_models[args.gpt_model](
+        vocab_size=args.codebook_size,
+        block_size=latent_size ** 2,
+        num_classes=args.num_classes,
+        cls_token_num=args.cls_token_num,
+        model_type=args.gpt_type,
+        hv_mix=getattr(args, "hv_mix", False),
+        hv_mix_init=getattr(args, "hv_mix_init", 0.5),
+    ).to(device=device, dtype=precision)
+
+    # If checkpoint contains LoRA weights, we must construct the same LoRA-wrapped modules before loading.
+    has_lora = isinstance(model_weight, dict) and any((".lora_A" in k or ".lora_B" in k) for k in model_weight.keys())
+    if args.use_lora or has_lora:
+        targets = [t.strip() for t in args.lora_targets.split(",") if t.strip()]
+        apply_lora(gpt_model, targets, args.lora_r, args.lora_alpha, args.lora_dropout, args.lora_train_base)
+        # Make sure newly replaced modules follow model device/dtype.
+        gpt_model.to(device=device, dtype=precision)
+
     # if 'freqs_cis' in model_weight:
     #     model_weight.pop('freqs_cis')
     gpt_model.load_state_dict(model_weight, strict=False)
@@ -168,7 +263,26 @@ if __name__ == "__main__":
     parser.add_argument("--from-fsdp", action='store_true')
     parser.add_argument("--cls-token-num", type=int, default=1, help="max token number of condition input")
     parser.add_argument("--precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
-    parser.add_argument("--compile", action='store_true', default=True)
+    # torch.compile is helpful on some setups but can fail depending on triton/driver.
+    # Keep it opt-in for robustness.
+    parser.add_argument("--compile", action='store_true', default=False)
+    parser.add_argument("--no-compile", action='store_true', default=False)
+
+    # Right/Below logits mixing (learnable alpha)
+    parser.add_argument("--hv-mix", action='store_true', help="enable learnable mixing between right/below logits")
+    parser.add_argument("--hv-mix-init", type=float, default=0.5, help="initial right(head) weight in [0,1]")
+
+    # LoRA (needed when sampling from LoRA-trained checkpoints)
+    parser.add_argument("--use-lora", action='store_true', help="Enable LoRA module wrapping before loading ckpt")
+    parser.add_argument("--lora-r", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=float, default=16.0)
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--lora-targets",
+        type=str,
+        default="attention.wqkv,attention.wo,feed_forward.w1,feed_forward.w2,feed_forward.w3",
+    )
+    parser.add_argument("--lora-train-base", action='store_true', help="Match training-time LoRA setting")
     parser.add_argument("--vq-model", type=str, choices=list(VQ_models.keys()), default="VQ-16")
     parser.add_argument("--vq-ckpt", type=str, default=None, help="ckpt path for vq model")
     parser.add_argument("--codebook-size", type=int, default=16384, help="codebook size for vector quantization")
@@ -187,4 +301,6 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=1.0, help="temperature value to sample with")
     parser.add_argument("--top-p", type=float, default=1.0, help="top-p value to sample with")
     args = parser.parse_args()
+    if getattr(args, "no_compile", False):
+        args.compile = False
     main(args)
