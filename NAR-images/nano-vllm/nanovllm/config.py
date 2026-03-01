@@ -83,6 +83,7 @@ class NARConfig:
 
     medusa_attention_num: int = 1
     torch_dtype: Any = field(default_factory=lambda: torch.bfloat16)
+    use_qk_norm: bool = False
     
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs):
