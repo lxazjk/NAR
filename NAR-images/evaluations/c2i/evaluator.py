@@ -32,6 +32,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("ref_batch", help="path to reference batch npz file")
     parser.add_argument("sample_batch", help="path to sample batch npz file")
+    parser.add_argument(
+        "--skip_pr",
+        action="store_true",
+        help="skip precision/recall (avoids expensive O(N^2) manifold computation)",
+    )
     args = parser.parse_args()
 
     config = tf.ConfigProto(
@@ -45,10 +50,25 @@ def main():
     # than after the next print(), to help prevent confusion.
     evaluator.warmup()
 
-    print("computing reference batch activations...")
-    ref_acts = evaluator.read_activations(args.ref_batch)
-    print("computing/reading reference batch statistics...")
-    ref_stats, ref_stats_spatial = evaluator.read_statistics(args.ref_batch, ref_acts)
+    # For large reference batches, computing activations + PR manifold can be extremely
+    # expensive (both time and memory). If the reference npz already contains mu/sigma
+    # stats, we can directly load them when PR is not required.
+    ref_obj = None
+    has_ref_stats = False
+    if not os.path.isdir(args.ref_batch):
+        ref_obj = np.load(args.ref_batch)
+        has_ref_stats = all(k in ref_obj for k in ["mu", "sigma", "mu_s", "sigma_s"])
+
+    if args.skip_pr and has_ref_stats:
+        print("reading reference batch statistics (precomputed)...")
+        ref_stats = FIDStatistics(ref_obj["mu"], ref_obj["sigma"])
+        ref_stats_spatial = FIDStatistics(ref_obj["mu_s"], ref_obj["sigma_s"])
+        ref_acts = None
+    else:
+        print("computing reference batch activations...")
+        ref_acts = evaluator.read_activations(args.ref_batch)
+        print("computing/reading reference batch statistics...")
+        ref_stats, ref_stats_spatial = evaluator.read_statistics(args.ref_batch, ref_acts)
 
     print("computing sample batch activations...")
     sample_acts = evaluator.read_activations(args.sample_batch)
@@ -62,18 +82,29 @@ def main():
     print("Inception Score:", IS)
     print("FID:", FID)
     print("sFID:", sFID)
-    prec, recall = evaluator.compute_prec_recall(ref_acts[0], sample_acts[0])
-    print("Precision:", prec)
-    print("Recall:", recall)
+    prec = recall = None
+    if args.skip_pr:
+        print("Precision/Recall: skipped")
+    else:
+        prec, recall = evaluator.compute_prec_recall(ref_acts[0], sample_acts[0])
+        print("Precision:", prec)
+        print("Recall:", recall)
 
-    txt_path = args.sample_batch.replace('.npz', '.txt')
+    if os.path.isdir(args.sample_batch):
+        txt_path = os.path.join(args.sample_batch, "metrics.txt")
+    else:
+        txt_path = args.sample_batch.replace('.npz', '.txt')
     print("writing to {}".format(txt_path))
     with open(txt_path, 'w') as f:
         print("Inception Score:", IS, file=f)
         print("FID:", FID, file=f)
         print("sFID:", sFID, file=f)
-        print("Precision:", prec, file=f)
-        print("Recall:", recall, file=f)
+        if args.skip_pr:
+            print("Precision:", "SKIPPED", file=f)
+            print("Recall:", "SKIPPED", file=f)
+        else:
+            print("Precision:", prec, file=f)
+            print("Recall:", recall, file=f)
 
 
 class InvalidFIDException(Exception):
@@ -180,6 +211,8 @@ class Evaluator:
     def read_statistics(
         self, npz_path: str, activations: Tuple[np.ndarray, np.ndarray]
     ) -> Tuple[FIDStatistics, FIDStatistics]:
+        if os.path.isdir(npz_path):
+            return tuple(self.compute_statistics(x) for x in activations)
         obj = np.load(npz_path)
         if "mu" in list(obj.keys()):
             return FIDStatistics(obj["mu"], obj["sigma"]), FIDStatistics(
@@ -529,8 +562,82 @@ class MemoryNpzArrayReader(NpzArrayReader):
         return max(0, self.arr.shape[0] - self.idx)
 
 
+def _npz_array_shape(path: str, arr_name: str):
+    with _open_npy_file(path, arr_name) as arr_f:
+        version = np.lib.format.read_magic(arr_f)
+        if version == (1, 0):
+            header = np.lib.format.read_array_header_1_0(arr_f)
+        elif version == (2, 0):
+            header = np.lib.format.read_array_header_2_0(arr_f)
+        else:
+            # Fallback: load the array fully.
+            with open(path, "rb") as f:
+                arr = np.load(f)[arr_name]
+            return arr.shape
+        shape, _, _ = header
+        return shape
+
+
+class DirectoryNpzArrayReader(NpzArrayReader):
+    """Read arr_0 from a directory of .npz shards.
+
+    Each shard is loaded into memory one-by-one to avoid keeping many file
+    handles open (streaming zip readers don't compose well across many files).
+    """
+
+    def __init__(self, paths: list[str], arr_name: str):
+        self.paths = paths
+        self.arr_name = arr_name
+        self.cur_idx = 0
+        self.cur_reader: Optional[MemoryNpzArrayReader] = None
+        self._counts = []
+        for p in self.paths:
+            shape = _npz_array_shape(p, arr_name)
+            self._counts.append(int(shape[0]))
+        self._remaining_total = int(sum(self._counts))
+
+    def _advance(self):
+        while self.cur_reader is None or self.cur_reader.remaining() == 0:
+            if self.cur_reader is not None:
+                self.cur_reader = None
+            if self.cur_idx >= len(self.paths):
+                return
+            self.cur_reader = MemoryNpzArrayReader.load(self.paths[self.cur_idx], self.arr_name)
+            self.cur_idx += 1
+
+    def read_batch(self, batch_size: int) -> Optional[np.ndarray]:
+        if self._remaining_total <= 0:
+            return None
+        self._advance()
+        if self.cur_reader is None:
+            return None
+        batch = self.cur_reader.read_batch(batch_size)
+        if batch is None:
+            self._advance()
+            if self.cur_reader is None:
+                return None
+            batch = self.cur_reader.read_batch(batch_size)
+        if batch is None:
+            return None
+        self._remaining_total -= int(batch.shape[0])
+        return batch
+
+    def remaining(self) -> int:
+        return max(0, self._remaining_total)
+
+
 @contextmanager
 def open_npz_array(path: str, arr_name: str) -> NpzArrayReader:
+    if os.path.isdir(path):
+        shard_paths = [
+            os.path.join(path, p)
+            for p in sorted(os.listdir(path))
+            if p.endswith('.npz')
+        ]
+        if not shard_paths:
+            raise ValueError(f"no .npz shards found in directory: {path}")
+        yield DirectoryNpzArrayReader(shard_paths, arr_name)
+        return
     with _open_npy_file(path, arr_name) as arr_f:
         version = np.lib.format.read_magic(arr_f)
         if version == (1, 0):
