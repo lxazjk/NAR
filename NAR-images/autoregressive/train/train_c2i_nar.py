@@ -249,7 +249,7 @@ def main(args):
             os.environ["WANDB_DIR"] = experiment_dir
             wandb.init(
                 project=args.wandb_project,
-                name=os.path.basename(experiment_dir),
+                name=(args.wandb_name if args.wandb_name else os.path.basename(experiment_dir)),
                 config=vars(args),
             )
 
@@ -914,6 +914,7 @@ if __name__ == "__main__":
 
     # wandb
     parser.add_argument("--wandb-project", type=str, default="c2i_nar")
+    parser.add_argument("--wandb-name", type=str, default="", help="Optional wandb run name override")
     parser.add_argument("--no-wandb", action="store_true")
 
     args = parser.parse_args()
