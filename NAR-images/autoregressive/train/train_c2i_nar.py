@@ -420,9 +420,9 @@ def main(args):
     if args.ema:
         ema.eval()
 
-    # Setup FID eval (rank0 only)
+    # Setup FID eval (all ranks for distributed sampling)
     vq_model = None
-    if rank == 0 and args.fid_ref is not None:
+    if args.fid_ref is not None:
         vq_model = VQ_models[args.vq_model](
             codebook_size=args.codebook_size,
             codebook_embed_dim=args.codebook_embed_dim,
@@ -431,7 +431,8 @@ def main(args):
         vq_model.load_state_dict(vq_ckpt["model"] if isinstance(vq_ckpt, dict) and "model" in vq_ckpt else vq_ckpt)
         vq_model.eval()
         del vq_ckpt
-        logger.info("VQ model loaded for FID evaluation.")
+        if rank == 0:
+            logger.info("VQ model loaded for FID evaluation.")
 
     ptdtype = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.mixed_precision]
     scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision == 'fp16'))
@@ -654,31 +655,33 @@ def main(args):
         scheduler.step()
         # Epoch-end FID evaluation (rank0 runs, others wait)
         if args.fid_ref is not None:
-            control_barrier()
             fid_ok = torch.tensor(1, device=device, dtype=torch.int32)
             npz_path = None
             txt_path = None
             metrics = {}
-            if rank == 0:
-                eval_model = ema if (args.ema and args.fid_use_ema) else (student.module._orig_mod if not args.no_compile else student.module)
-                try:
-                    sample_dir = os.path.join(args.fid_sample_dir, "latest")
-                    npz_path, txt_path, metrics = run_fid_eval(
-                        args,
-                        eval_model,
-                        vq_model,
-                        device,
-                        train_steps,
-                        logger,
-                        generate,
-                        epoch=epoch,
-                        sample_dir=sample_dir,
-                        keep_last_samples=True,
-                    )
-                except Exception as e:
-                    fid_ok.fill_(0)
-                    logger.exception(f"FID eval failed at epoch={epoch}, step={train_steps}: {e}")
+            eval_model = ema if (args.ema and args.fid_use_ema) else (student.module._orig_mod if not args.no_compile else student.module)
+            try:
+                sample_dir = os.path.join(args.fid_sample_dir, "latest")
+                npz_path, txt_path, metrics = run_fid_eval(
+                    args,
+                    eval_model,
+                    vq_model,
+                    device,
+                    train_steps,
+                    logger,
+                    generate,
+                    epoch=epoch,
+                    sample_dir=sample_dir,
+                    keep_last_samples=True,
+                    rank=rank,
+                    world_size=dist.get_world_size(),
+                    barrier=control_barrier,
+                )
+            except Exception as e:
+                fid_ok.fill_(0)
+                logger.exception(f"FID eval failed at epoch={epoch}, step={train_steps}: {e}")
 
+            if rank == 0:
                 if eval_writer is not None:
                     payload = {
                         "epoch": epoch,
