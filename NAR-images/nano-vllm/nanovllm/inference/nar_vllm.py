@@ -173,7 +173,7 @@ class NARPagedLLM:
         slot = block_id * self.kvcache_block_size + offset
         return slot.reshape(-1)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate_image(
         self,
         condition: torch.Tensor,
@@ -433,7 +433,7 @@ class NARContinuousBatcher:
     def is_finished(self) -> bool:
         return len(self._active) == 0
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def step(self):
         """推进所有活跃请求一个对角 step（按 step 分组）。"""
         if not self._active:

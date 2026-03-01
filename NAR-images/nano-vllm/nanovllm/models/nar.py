@@ -162,6 +162,7 @@ class NARDecoderLayer(nn.Module):
             head_dim=config.dim // config.n_head,
             rms_norm_eps=config.norm_eps,
             rope_theta=config.rope_base,
+            # use_qk_norm=config.use_qk_norm,
         )
         self.mlp = NARMLP(config)
         self.input_layernorm = RMSNorm(config.dim, eps=config.norm_eps)

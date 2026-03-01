@@ -255,7 +255,7 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if self.model_type == "nar":
             return self._run_nar_model(input_ids, positions, is_prefill)
@@ -309,7 +309,7 @@ class ModelRunner:
         reset_context()
         return token_ids
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def capture_cudagraph(self):
         config = self.config
         if self.model_type == "nar":

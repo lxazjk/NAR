@@ -100,6 +100,7 @@ class NARAttention(nn.Module):
         head_dim: int,
         rms_norm_eps: float = 1e-6,
         rope_theta: float = 10000,
+        use_qk_norm: bool = False,
     ):
         super().__init__()
         tp_size = 1
@@ -125,8 +126,13 @@ class NARAttention(nn.Module):
         self.qkv_proj = nn.Linear(hidden_size, self.q_size + 2 * self.kv_size, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, hidden_size, bias=False)
         
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.use_qk_norm = bool(use_qk_norm)
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
         
         self.k_cache = self.v_cache = torch.tensor([])
         self._flex_attention_compiled = None
@@ -236,8 +242,9 @@ class NARAttention(nn.Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         
         if freqs_cis is not None:
             q, k = self._apply_rotary_emb(freqs_cis, q, k)
