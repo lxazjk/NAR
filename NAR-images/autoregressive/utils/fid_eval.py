@@ -64,6 +64,9 @@ def run_fid_eval(
     epoch: Optional[int] = None,
     sample_dir: Optional[str] = None,
     keep_last_samples: bool = True,
+    rank: int = 0,
+    world_size: int = 1,
+    barrier=None,
 ) -> Tuple[Optional[str], Optional[str], Dict[str, float]]:
     if args.fid_ref is None:
         logger.info("FID eval skipped: --fid-ref not provided.")
@@ -72,19 +75,26 @@ def run_fid_eval(
     if sample_dir is None:
         sample_dir = os.path.join(args.fid_sample_dir, "latest")
     os.makedirs(args.fid_sample_dir, exist_ok=True)
-    if keep_last_samples:
+    if rank == 0 and keep_last_samples:
         _clean_dir(sample_dir)
-    else:
+    elif rank == 0:
         os.makedirs(sample_dir, exist_ok=True)
+    if barrier is not None:
+        barrier()
 
     model.eval()
     vq_model.eval()
 
     latent_size = args.image_size // args.downsample_size
+    per_rank = (args.fid_num_samples + world_size - 1) // world_size
+    start = rank * per_rank
+    end = min(start + per_rank, args.fid_num_samples)
+    local_num = max(0, end - start)
+
     total = 0
-    num_iters = math.ceil(args.fid_num_samples / args.fid_batch_size)
+    num_iters = math.ceil(local_num / args.fid_batch_size) if local_num > 0 else 0
     for _ in range(num_iters):
-        n = min(args.fid_batch_size, args.fid_num_samples - total)
+        n = min(args.fid_batch_size, local_num - total)
         if n <= 0:
             break
         c_indices = torch.randint(0, args.num_classes, (n,), device=device)
@@ -109,32 +119,38 @@ def run_fid_eval(
 
         from PIL import Image
         for i, sample in enumerate(samples):
-            Image.fromarray(sample).save(f"{sample_dir}/{total + i:06d}.png")
+            Image.fromarray(sample).save(f"{sample_dir}/{start + total + i:06d}.png")
         total += n
 
-    npz_path = create_npz_from_samples(sample_dir, args.fid_num_samples)
-    logger.info(f"Saved FID samples to {npz_path}")
+    if barrier is not None:
+        barrier()
+
+    npz_path = None
+    if rank == 0:
+        npz_path = create_npz_from_samples(sample_dir, args.fid_num_samples)
+        logger.info(f"Saved FID samples to {npz_path}")
 
     txt_path = None
     metrics = {}
-    if getattr(args, "fid_skip_evaluator", False):
-        logger.info("Skipping FID evaluator (--fid-skip-evaluator enabled).")
-    else:
-        evaluator_path = os.path.join(_repo_root(), "evaluations", "c2i", "evaluator.py")
-        cmd = ["python3", evaluator_path, args.fid_ref, npz_path]
-        logger.info(f"Running FID evaluator: {' '.join(cmd)}")
-        try:
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = "-1"
-            subprocess.run(cmd, check=False, cwd=_repo_root(), env=env)
-            txt_path = npz_path.replace(".npz", ".txt")
-            metrics = _parse_eval_txt(txt_path)
-        except Exception as e:
-            logger.info(f"FID evaluator failed: {e}")
+    if rank == 0:
+        if getattr(args, "fid_skip_evaluator", False):
+            logger.info("Skipping FID evaluator (--fid-skip-evaluator enabled).")
+        else:
+            evaluator_path = os.path.join(_repo_root(), "evaluations", "c2i", "evaluator.py")
+            cmd = ["python3", evaluator_path, args.fid_ref, npz_path]
+            logger.info(f"Running FID evaluator: {' '.join(cmd)}")
+            try:
+                env = os.environ.copy()
+                env["CUDA_VISIBLE_DEVICES"] = "-1"
+                subprocess.run(cmd, check=False, cwd=_repo_root(), env=env)
+                txt_path = npz_path.replace(".npz", ".txt")
+                metrics = _parse_eval_txt(txt_path)
+            except Exception as e:
+                logger.info(f"FID evaluator failed: {e}")
 
     model.train()
 
-    if epoch is not None:
+    if rank == 0 and epoch is not None:
         logger.info(f"FID eval done for epoch={epoch}, step={step}.")
 
     return npz_path, txt_path, metrics
