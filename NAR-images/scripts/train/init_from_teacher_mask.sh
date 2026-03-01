@@ -1,0 +1,16 @@
+  torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
+    --cloud-save-path ./cloud_ckpt \
+    --dataset imagenet_code --image-size 256 --downsample-size 16 \
+    --gpt-model GPT-L --gpt-type c2i \
+    --init-ckpt ./pretrained_models/c2i_L_256.pt \
+    --epochs 30 --steps-per-epoch 2500 \
+    --global-batch-size 512 --num-workers 24 --log-every 100 --log-loss-every 500 \
+    --kd-weight 0 \
+    --mask-schedule shrink --mask-anneal-steps 20000 \
+    --fid-ref ./pretrained_models/VIRTUAL_imagenet256_labeled.npz \
+    --fid-num-samples 50000 --fid-batch-size 256 \
+    --fid-sample-dir samples_c2i \
+    --vq-ckpt ./pretrained_models/vq_ds16_c2i.pt \
+    --wandb-project c2i_nar \
+    --wandb-name init_teacher_shrink_30x2500_gptl \
+    --no-compile
