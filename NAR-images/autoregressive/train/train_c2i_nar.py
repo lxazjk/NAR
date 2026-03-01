@@ -3,20 +3,18 @@
 #   nanoGPT: https://github.com/karpathy/nanoGPT/blob/master/model.py
 import argparse
 import inspect
-import math
 import os
 import random
 import time
-import subprocess
 import contextlib
 from datetime import timedelta
 from copy import deepcopy
 from glob import glob
-from typing import Optional
+
+import wandb
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -40,6 +38,8 @@ from autoregressive.models.generate import generate
 from tokenizer.tokenizer_image.vq_model import VQ_models
 from LlamaGen.autoregressive.models.gpt import GPT_models as AR_GPT_models
 from autoregressive.utils.mask import build_masks, pick_mask
+from autoregressive.utils.fid_eval import run_fid_eval
+from autoregressive.utils.train_logging import JsonlWriter
 
 
 #################################################################################
@@ -159,84 +159,6 @@ def resolve_resume_ckpt(args, logger):
     return best
 
 
-#################################################################################
-#                               FID Evaluation                                 #
-#################################################################################
-def create_npz_from_samples(sample_dir, num):
-    from PIL import Image
-    import numpy as np
-
-    samples = []
-    for i in range(num):
-        sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
-        sample_np = np.asarray(sample_pil).astype(np.uint8)
-        samples.append(sample_np)
-    samples = np.stack(samples)
-    npz_path = f"{sample_dir}.npz"
-    np.savez(npz_path, arr_0=samples)
-    return npz_path
-
-
-@torch.no_grad()
-def run_fid_eval(args, model, vq_model, device, step, logger):
-    if args.fid_ref is None:
-        logger.info("FID eval skipped: --fid-ref not provided.")
-        return
-    os.makedirs(args.fid_sample_dir, exist_ok=True)
-
-    model.eval()
-    vq_model.eval()
-
-    latent_size = args.image_size // args.downsample_size
-    total = 0
-    sample_dir = os.path.join(args.fid_sample_dir, f"fid_step_{step:07d}")
-    os.makedirs(sample_dir, exist_ok=True)
-
-    num_iters = math.ceil(args.fid_num_samples / args.fid_batch_size)
-    for _ in range(num_iters):
-        n = min(args.fid_batch_size, args.fid_num_samples - total)
-        if n <= 0:
-            break
-        c_indices = torch.randint(0, args.num_classes, (n,), device=device)
-        qzshape = [n, args.codebook_embed_dim, latent_size, latent_size]
-
-        index_sample = generate(
-            model, c_indices, latent_size ** 2,
-            cfg_scale=args.fid_cfg_scale, cfg_interval=args.fid_cfg_interval,
-            temperature=args.fid_temperature, top_k=args.fid_top_k,
-            top_p=args.fid_top_p, sample_logits=True,
-        )
-        samples = vq_model.decode_code(index_sample, qzshape)
-        if args.image_size_eval != args.image_size:
-            samples = F.interpolate(samples, size=(args.image_size_eval, args.image_size_eval), mode='bicubic')
-        samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1)
-        samples = samples.to("cpu", dtype=torch.uint8).numpy()
-
-        from PIL import Image
-        for i, sample in enumerate(samples):
-            Image.fromarray(sample).save(f"{sample_dir}/{total + i:06d}.png")
-        total += n
-
-    npz_path = create_npz_from_samples(sample_dir, args.fid_num_samples)
-    logger.info(f"Saved FID samples to {npz_path}")
-
-    if getattr(args, "fid_skip_evaluator", False):
-        logger.info("Skipping FID evaluator (--fid-skip-evaluator enabled).")
-        model.train()
-        return
-
-    evaluator_path = os.path.join(ROOT, "evaluations", "c2i", "evaluator.py")
-    cmd = ["python3", evaluator_path, args.fid_ref, npz_path]
-    logger.info(f"Running FID evaluator: {' '.join(cmd)}")
-    try:
-        # Run evaluator on CPU to avoid TF grabbing GPU memory and crashing training.
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = "-1"
-        subprocess.run(cmd, check=False, cwd=ROOT, env=env)
-    except Exception as e:
-        logger.info(f"FID evaluator failed: {e}")
-
-    model.train()
 
 
 #################################################################################
@@ -266,6 +188,7 @@ def create_optimizer(model, weight_decay, learning_rate, betas, logger):
 #################################################################################
 def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    assert args.steps_per_epoch > 0, "--steps-per-epoch must be > 0."
 
     # Setup DDP
     init_distributed_mode(args)
@@ -277,6 +200,7 @@ def main(args):
     torch.cuda.set_device(device)
 
     # Setup experiment folder
+    experiment_dir = None
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
         model_string_name = args.gpt_model.replace("/", "-")
@@ -311,6 +235,24 @@ def main(args):
     else:
         logger = create_logger(None)
 
+    # WandB + local metric logs (rank0 only)
+    loss_writer = None
+    eval_writer = None
+    if rank == 0:
+        if experiment_dir is not None and not os.path.isabs(args.fid_sample_dir):
+            args.fid_sample_dir = os.path.join(experiment_dir, args.fid_sample_dir)
+        metrics_dir = os.path.join(experiment_dir, "metrics")
+        loss_writer = JsonlWriter(os.path.join(metrics_dir, "train_loss_steps.jsonl"))
+        eval_writer = JsonlWriter(os.path.join(metrics_dir, "eval_metrics.jsonl"))
+
+        if not args.no_wandb:
+            os.environ["WANDB_DIR"] = experiment_dir
+            wandb.init(
+                project=args.wandb_project,
+                name=os.path.basename(experiment_dir),
+                config=vars(args),
+            )
+
     # Use a dedicated Gloo process group for long-running synchronization points
     # (e.g., FID evaluation / checkpointing on rank-0). This avoids NCCL watchdog
     # timeouts on `dist.barrier()` while rank-0 is busy doing heavy CPU/GPU work.
@@ -335,6 +277,11 @@ def main(args):
 
     logger.info(f"{args}")
     logger.info(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    if rank == 0:
+        if args.fid_every and args.fid_every > 0:
+            logger.info("Note: --fid-every is ignored; FID eval runs at the end of every epoch.")
+        if args.ckpt_every and args.ckpt_every > 0:
+            logger.info("Note: --ckpt-every is ignored; only last_version.pt is kept (overwritten each epoch).")
 
     # Setup student model (NAR)
     if args.drop_path_rate > 0.0:
@@ -369,11 +316,6 @@ def main(args):
     args.gpt_ckpt = resolve_resume_ckpt(args, logger if rank == 0 else None)
     resume_ckpt = load_checkpoint(args.gpt_ckpt, map_location="cpu") if args.gpt_ckpt else None
 
-    # Apply LoRA before loading resume ckpt so LoRA params are present
-    if resume_ckpt is not None and args.use_lora:
-        targets = [t.strip() for t in args.lora_targets.split(",") if t.strip()]
-        apply_lora(student, targets, args.lora_r, args.lora_alpha, args.lora_dropout, args.lora_train_base, logger)
-
     if resume_ckpt is not None:
         ckpt_state = normalize_state_dict(extract_state_dict(resume_ckpt))
         student.load_state_dict(ckpt_state, strict=False)
@@ -392,11 +334,6 @@ def main(args):
             del teacher_ckpt
         if args.ema:
             update_ema(ema, student, decay=0)
-
-        # Apply LoRA after teacher init so base weights are reused
-        if args.use_lora:
-            targets = [t.strip() for t in args.lora_targets.split(",") if t.strip()]
-            apply_lora(student, targets, args.lora_r, args.lora_alpha, args.lora_dropout, args.lora_train_base, logger)
 
     # Setup optimizer
     optimizer = create_optimizer(student, args.weight_decay, args.lr, (args.beta1, args.beta2), logger)
@@ -435,8 +372,8 @@ def main(args):
     logger.info(
         f"Dataset contains {len(dataset):,} images ({args.code_path}) {flip_info} flip augmentation and {aug_info} crop augmentation{subset_info}"
     )
+    steps_per_epoch = int(args.steps_per_epoch)
     if resume_ckpt is not None and train_steps > 0:
-        steps_per_epoch = int(len(dataset) / args.global_batch_size)
         start_epoch = int(train_steps / max(steps_per_epoch, 1))
 
     # Setup teacher model for distillation
@@ -483,9 +420,9 @@ def main(args):
     if args.ema:
         ema.eval()
 
-    # Setup FID eval
+    # Setup FID eval (rank0 only)
     vq_model = None
-    if rank == 0 and (args.fid_every > 0 or args.eval_on_early_stop):
+    if rank == 0 and args.fid_ref is not None:
         vq_model = VQ_models[args.vq_model](
             codebook_size=args.codebook_size,
             codebook_embed_dim=args.codebook_embed_dim,
@@ -510,21 +447,6 @@ def main(args):
     micro_step = 0
     optimizer.zero_grad(set_to_none=True)
 
-    # Early stop state (rank0 decides, then we sync a stop flag)
-    early_stopper = None
-    early_stop_triggered = False
-    early_stop_reason = ""
-    early_stop_step = -1
-    if rank == 0 and args.early_stop:
-        early_stopper = EarlyStopper(
-            mode=args.early_stop_mode,
-            patience_checks=args.early_stop_patience,
-            min_delta=args.early_stop_min_delta,
-            ema_decay=args.early_stop_ema_decay,
-            threshold=(None if args.early_stop_threshold < 0 else args.early_stop_threshold),
-            logger=logger,
-        )
-
     logger.info(f"Training for {args.epochs} epochs...")
     stop_training = False
     for epoch in range(start_epoch, args.epochs):
@@ -533,7 +455,14 @@ def main(args):
         accum_loss = 0.0
         accum_ce = 0.0
         accum_kd = 0.0
-        for x, y in loader:
+        epoch_steps = 0
+        data_iter = iter(loader)
+        while epoch_steps < steps_per_epoch:
+            try:
+                x, y = next(data_iter)
+            except StopIteration:
+                data_iter = iter(loader)
+                continue
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             z_indices = x.reshape(x.shape[0], -1)
@@ -646,41 +575,45 @@ def main(args):
                 accum_kd = 0.0
                 log_steps += 1
                 train_steps += 1
+                epoch_steps += 1
 
                 if args.max_steps is not None and args.max_steps > 0 and train_steps >= args.max_steps:
                     stop_training = True
 
-                # Convergence / early-stop check (do it on a fixed cadence to keep all ranks in sync)
-                if args.early_stop and (train_steps >= args.early_stop_warmup_steps) and (train_steps % args.early_stop_check_every == 0):
-                    # Compute averaged metrics across ranks (cheap because it's infrequent)
-                    cur_loss = torch.tensor(step_loss_val, device=device)
-                    cur_ce = torch.tensor(step_ce_val, device=device)
-                    cur_kd = torch.tensor(step_kd_val, device=device)
-                    dist.all_reduce(cur_loss, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(cur_ce, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(cur_kd, op=dist.ReduceOp.SUM)
-                    cur_loss = (cur_loss.item() / dist.get_world_size())
-                    cur_ce = (cur_ce.item() / dist.get_world_size())
-                    cur_kd = (cur_kd.item() / dist.get_world_size())
-
-                    if rank == 0 and early_stopper is not None:
-                        metric_map = {"loss": cur_loss, "ce": cur_ce, "kd": cur_kd}
-                        mval = metric_map.get(args.early_stop_metric, cur_ce)
-                        should_stop, reason = early_stopper.update(
-                            mval,
+                # Per-step logging (global average)
+                step_loss_t = torch.tensor(step_loss_val, device=device)
+                step_ce_t = torch.tensor(step_ce_val, device=device)
+                step_kd_t = torch.tensor(step_kd_val, device=device)
+                dist.all_reduce(step_loss_t, op=dist.ReduceOp.SUM)
+                dist.all_reduce(step_ce_t, op=dist.ReduceOp.SUM)
+                dist.all_reduce(step_kd_t, op=dist.ReduceOp.SUM)
+                step_loss_avg = step_loss_t.item() / dist.get_world_size()
+                step_ce_avg = step_ce_t.item() / dist.get_world_size()
+                step_kd_avg = step_kd_t.item() / dist.get_world_size()
+                if rank == 0 and loss_writer is not None and (train_steps % args.log_loss_every == 0):
+                    loss_writer.write(
+                        {
+                            "step": train_steps,
+                            "epoch": epoch,
+                            "epoch_step": epoch_steps,
+                            "loss": step_loss_avg,
+                            "ce": step_ce_avg,
+                            "kd": step_kd_avg,
+                            "lr": scheduler.get_last_lr()[0],
+                        }
+                    )
+                    if not args.no_wandb:
+                        wandb.log(
+                            {
+                                "train/loss": step_loss_avg,
+                                "train/ce": step_ce_avg,
+                                "train/kd": step_kd_avg,
+                                "train/lr": scheduler.get_last_lr()[0],
+                                "train/epoch": epoch,
+                                "train/epoch_step": epoch_steps,
+                            },
                             step=train_steps,
-                            wall_time_s=(time.time() - start_time_all),
                         )
-                        if should_stop:
-                            stop_training = True
-                            early_stop_triggered = True
-                            early_stop_reason = reason
-                            early_stop_step = int(train_steps)
-                            logger.info(
-                                f"EarlyStop triggered at step={train_steps} metric={args.early_stop_metric} "
-                                f"ema_best={early_stopper.best:.6f}@step{early_stopper.best_step} "
-                                f"elapsed_s={time.time() - start_time_all:.1f} reason={reason}"
-                            )
 
                 # Make stop decision consistent across ranks to avoid hanging.
                 stop_flag = torch.tensor(1 if stop_training else 0, device=device, dtype=torch.int32)
@@ -719,119 +652,96 @@ def main(args):
                     log_steps = 0
                     start_time = time.time()
 
-            # Save checkpoint
-            if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                if rank == 0:
-                    if not args.no_compile:
-                        model_weight = student.module._orig_mod.state_dict()
-                    else:
-                        model_weight = student.module.state_dict()
-                    checkpoint = {
-                        "model": model_weight,
-                        "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(),
-                        "steps": train_steps,
-                        "args": args,
-                    }
-                    if args.ema:
-                        checkpoint["ema"] = ema.state_dict()
-                    if not args.no_local_save:
-                        checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                        torch.save(checkpoint, checkpoint_path)
-                        logger.info(f"Saved checkpoint to {checkpoint_path}")
-                    cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, cloud_checkpoint_path)
-                    logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
-                control_barrier()
-
-            # FID evaluation
-            if args.fid_every > 0 and train_steps % args.fid_every == 0:
-                fid_ok = torch.tensor(1, device=device, dtype=torch.int32)
-                if rank == 0:
-                    eval_model = ema if (args.ema and args.fid_use_ema) else (student.module._orig_mod if not args.no_compile else student.module)
-                    try:
-                        run_fid_eval(args, eval_model, vq_model, device, train_steps, logger)
-                    except Exception as e:
-                        fid_ok.fill_(0)
-                        logger.exception(f"FID eval failed at step={train_steps}: {e}")
-
-                # Sync FID status across ranks to avoid one-rank crash causing a hang.
-                control_all_reduce_min(fid_ok)
-                if fid_ok.item() == 0:
-                    if rank == 0:
-                        logger.info(f"FID eval failed; --fid-fail-action={args.fid_fail_action}.")
-                    if args.fid_fail_action == "stop":
-                        stop_training = True
-                control_barrier()
-
             if stop_training:
                 break
         scheduler.step()
+        # Epoch-end FID evaluation (rank0 runs, others wait)
+        if args.fid_ref is not None:
+            control_barrier()
+            fid_ok = torch.tensor(1, device=device, dtype=torch.int32)
+            npz_path = None
+            txt_path = None
+            metrics = {}
+            if rank == 0:
+                eval_model = ema if (args.ema and args.fid_use_ema) else (student.module._orig_mod if not args.no_compile else student.module)
+                try:
+                    sample_dir = os.path.join(args.fid_sample_dir, "latest")
+                    npz_path, txt_path, metrics = run_fid_eval(
+                        args,
+                        eval_model,
+                        vq_model,
+                        device,
+                        train_steps,
+                        logger,
+                        generate,
+                        epoch=epoch,
+                        sample_dir=sample_dir,
+                        keep_last_samples=True,
+                    )
+                except Exception as e:
+                    fid_ok.fill_(0)
+                    logger.exception(f"FID eval failed at epoch={epoch}, step={train_steps}: {e}")
+
+                if eval_writer is not None:
+                    payload = {
+                        "epoch": epoch,
+                        "step": train_steps,
+                        "npz_path": npz_path,
+                        "txt_path": txt_path,
+                    }
+                    payload.update(metrics)
+                    eval_writer.write(payload)
+                if not args.no_wandb:
+                    wb_payload = {"eval/epoch": epoch}
+                    for k, v in metrics.items():
+                        wb_payload[f"eval/{k}"] = v
+                    wandb.log(wb_payload, step=train_steps)
+
+            # Sync FID status across ranks to avoid one-rank crash causing a hang.
+            control_all_reduce_min(fid_ok)
+            if fid_ok.item() == 0:
+                if rank == 0:
+                    logger.info(f"FID eval failed; --fid-fail-action={args.fid_fail_action}.")
+                if args.fid_fail_action == "stop":
+                    stop_training = True
+            control_barrier()
+
+        # Save last checkpoint only (overwrite each epoch)
+        if rank == 0:
+            if not args.no_compile:
+                model_weight = student.module._orig_mod.state_dict()
+            else:
+                model_weight = student.module.state_dict()
+            checkpoint = {
+                "model": model_weight,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "steps": train_steps,
+                "args": args,
+            }
+            if args.ema:
+                checkpoint["ema"] = ema.state_dict()
+            if not args.no_local_save:
+                checkpoint_path = f"{checkpoint_dir}/last_version.pt"
+                torch.save(checkpoint, checkpoint_path)
+                logger.info(f"Saved checkpoint to {checkpoint_path}")
+            cloud_checkpoint_path = f"{cloud_checkpoint_dir}/last_version.pt"
+            torch.save(checkpoint, cloud_checkpoint_path)
+            logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
+
         if stop_training:
             if rank == 0 and (args.max_steps is not None and args.max_steps > 0 and train_steps >= args.max_steps):
                 logger.info(f"Reached --max-steps={args.max_steps}, stopping early.")
             break
 
-    # Optional: save a checkpoint right when early-stop triggers (even if ckpt_every is large)
-    es_flag = torch.tensor(1 if early_stop_triggered else 0, device=device, dtype=torch.int32)
-    dist.all_reduce(es_flag, op=dist.ReduceOp.MAX)
-    early_stop_triggered = bool(es_flag.item())
-
-    if early_stop_triggered and args.save_on_early_stop and rank == 0:
-        if not args.no_compile:
-            model_weight = student.module._orig_mod.state_dict()
-        else:
-            model_weight = student.module.state_dict()
-        checkpoint = {
-            "model": model_weight,
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "steps": train_steps,
-            "args": args,
-        }
-        if args.ema:
-            checkpoint["ema"] = ema.state_dict()
-        if not args.no_local_save:
-            checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-            torch.save(checkpoint, checkpoint_path)
-            logger.info(f"Saved early-stop checkpoint to {checkpoint_path}")
-        cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
-        torch.save(checkpoint, cloud_checkpoint_path)
-        logger.info(f"Saved early-stop checkpoint in cloud to {cloud_checkpoint_path}")
-
-    # Optional: run evaluation immediately after early-stop (rank0 runs, others wait)
-    if early_stop_triggered and args.eval_on_early_stop:
-        control_barrier()
-        fid_ok = torch.tensor(1, device=device, dtype=torch.int32)
-        if rank == 0:
-            if args.fid_ref is None:
-                logger.info("eval-on-early-stop enabled but --fid-ref is not provided; skipping.")
-            else:
-                eval_model = ema if (args.ema and args.fid_use_ema) else (student.module._orig_mod if not args.no_compile else student.module)
-                try:
-                    run_fid_eval(args, eval_model, vq_model, device, train_steps, logger)
-                except Exception as e:
-                    fid_ok.fill_(0)
-                    logger.exception(f"eval-on-early-stop FID failed at step={train_steps}: {e}")
-
-        control_all_reduce_min(fid_ok)
-        if fid_ok.item() == 0 and args.fid_fail_action == "stop":
-            if rank == 0:
-                logger.info("eval-on-early-stop FID failed; stopping.")
-        control_barrier()
-
-    # Save last checkpoint
-    if rank == 0:
-        if not args.no_compile:
-            model_weight = student.module._orig_mod.state_dict()
-        else:
-            model_weight = student.module.state_dict()
-        checkpoint = {"model": model_weight}
-        cloud_checkpoint_path = f"{cloud_checkpoint_dir}/last_version.pt"
-        torch.save(checkpoint, cloud_checkpoint_path)
-        logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
-
     student.eval()
+    if rank == 0:
+        if loss_writer is not None:
+            loss_writer.close()
+        if eval_writer is not None:
+            eval_writer.close()
+        if not args.no_wandb:
+            wandb.finish()
     logger.info("Done!")
     dist.destroy_process_group()
 
@@ -908,23 +818,10 @@ if __name__ == "__main__":
     parser.add_argument("--kd-temperature", type=float, default=1.0)
     parser.add_argument("--ce-weight", type=float, default=1.0)
 
-    # lora
-    parser.add_argument("--use-lora", action='store_true')
-    parser.add_argument("--lora-r", type=int, default=8)
-    parser.add_argument("--lora-alpha", type=float, default=16.0)
-    parser.add_argument("--lora-dropout", type=float, default=0.0)
-    # Match actual module names in this repo's GPT implementation:
-    # layers.{i}.attention.(wqkv|wo) and layers.{i}.feed_forward.(w1|w2|w3)
-    parser.add_argument(
-        "--lora-targets",
-        type=str,
-        default="attention.wqkv,attention.wo,feed_forward.w1,feed_forward.w2,feed_forward.w3",
-    )
-    parser.add_argument("--lora-train-base", action='store_true', help="also train base weights when using LoRA")
-
     # optimization
     parser.add_argument("--ema", action='store_true')
-    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--steps-per-epoch", type=int, default=2500)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-2)
     parser.add_argument("--beta1", type=float, default=0.9)
@@ -934,7 +831,8 @@ if __name__ == "__main__":
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=24)
     parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--ckpt-every", type=int, default=10000)
+    parser.add_argument("--log-loss-every", type=int, default=500, help="Log train/loss/ce/kd/lr/epoch every N steps")
+    parser.add_argument("--ckpt-every", type=int, default=10000, help="ignored; only last checkpoint is kept")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"])
 
@@ -984,73 +882,8 @@ if __name__ == "__main__":
         help="Stop after this many optimizer steps (i.e., after gradient accumulation sync). -1 means no limit.",
     )
 
-    # convergence / early stop
-    parser.add_argument("--early-stop", action='store_true', help="Enable convergence-based early stopping")
-    parser.add_argument(
-        "--early-stop-metric",
-        type=str,
-        default="ce",
-        choices=["loss", "ce", "kd"],
-        help="Which metric to monitor for convergence (lower is better).",
-    )
-    parser.add_argument(
-        "--early-stop-mode",
-        type=str,
-        default="plateau",
-        choices=["plateau", "threshold", "both"],
-        help="Stop on plateau, threshold, or both.",
-    )
-    parser.add_argument(
-        "--early-stop-warmup-steps",
-        type=int,
-        default=500,
-        help="Do not consider early stop before this optimizer step.",
-    )
-    parser.add_argument(
-        "--early-stop-check-every",
-        type=int,
-        default=50,
-        help="Check convergence every N optimizer steps (must be the same on all ranks).",
-    )
-    parser.add_argument(
-        "--early-stop-patience",
-        type=int,
-        default=20,
-        help="Plateau patience in number of checks (so effective patience in steps is patience*check_every).",
-    )
-    parser.add_argument(
-        "--early-stop-min-delta",
-        type=float,
-        default=1e-3,
-        help="Minimum EMA improvement to be considered progress.",
-    )
-    parser.add_argument(
-        "--early-stop-ema-decay",
-        type=float,
-        default=0.95,
-        help="EMA decay for smoothing the monitored metric. Larger = smoother.",
-    )
-    parser.add_argument(
-        "--early-stop-threshold",
-        type=float,
-        default=-1.0,
-        help="If >=0, stop when EMA(metric) <= threshold. -1 disables threshold stop.",
-    )
-
-    # early-stop side effects
-    parser.add_argument(
-        "--eval-on-early-stop",
-        action='store_true',
-        help="If set, run FID evaluation once immediately after early-stop (rank0 only). Requires --fid-ref and --vq-ckpt.",
-    )
-    parser.add_argument(
-        "--save-on-early-stop",
-        action='store_true',
-        help="If set, save a step checkpoint when early-stop triggers (in addition to last_version.pt).",
-    )
-
     # fid evaluation
-    parser.add_argument("--fid-every", type=int, default=0)
+    parser.add_argument("--fid-every", type=int, default=0, help="ignored; eval runs at the end of every epoch")
     parser.add_argument("--fid-ref", type=str, default=None)
     parser.add_argument("--fid-num-samples", type=int, default=50000)
     parser.add_argument("--fid-batch-size", type=int, default=32)
@@ -1078,6 +911,10 @@ if __name__ == "__main__":
     parser.add_argument("--codebook-size", type=int, default=16384)
     parser.add_argument("--codebook-embed-dim", type=int, default=8)
     parser.add_argument("--image-size-eval", type=int, choices=[256, 384, 512], default=256)
+
+    # wandb
+    parser.add_argument("--wandb-project", type=str, default="c2i_nar")
+    parser.add_argument("--no-wandb", action="store_true")
 
     args = parser.parse_args()
     main(args)
