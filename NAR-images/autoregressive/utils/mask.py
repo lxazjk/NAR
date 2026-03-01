@@ -52,56 +52,11 @@ def pick_mask(
     step,
     anneal_steps,
     rng,
-    delta_indices=None,
     removal_indices=None,
-    switch_step: int = 2000,
-    prox_steps: int = 500,
 ):
-    if schedule == "static_causal":
-        return mask_causal, 0.0, None
     if schedule == "static_proximity":
         return mask_proximity, 1.0, None
-    if schedule == "static_union":
-        return mask_union, 0.0, None
-    if schedule == "linear_then_proximity":
-        # Per user request: MaskP should represent UNION -> PROXIMITY.
-        # We therefore start from UNION (MaskP=0), then progressively remove edges
-        # that are present in CAUSAL but NOT in PROXIMITY (i.e., `removal_indices`).
-        # After `switch_step` optimizer steps, we keep PROXIMITY fixed.
-        if switch_step <= 0:
-            return mask_proximity, 1.0, None
-
-        # Make the last step in the anneal window reach p=1.0 while keeping p(0)=0.
-        denom = max(1, int(switch_step) - 1)
-        p = min(1.0, step / denom)
-        if p >= 1.0:
-            return mask_proximity, 1.0, None
-
-        mask = mask_union.clone()
-        if removal_indices is not None:
-            for q, idx in enumerate(removal_indices):
-                if idx.numel() == 0:
-                    continue
-                # Use ceil so progress is monotonic and we don't lag behind near p~1.
-                k = int(math.ceil(p * idx.numel()))
-                if k > 0:
-                    mask[:, q, idx[:k]] = False
-        return mask, p, None
-    if schedule in ("progressive", "linear"):
-        if anneal_steps <= 0:
-            return mask_union, 1.0, None
-        p = min(1.0, step / anneal_steps)
-        mask = mask_causal.clone()
-        if delta_indices is not None:
-            for q, idx in enumerate(delta_indices):
-                if idx.numel() == 0:
-                    continue
-                k = int(math.ceil(p * idx.numel()))
-                if k <= 0:
-                    continue
-                mask[:, q, idx[:k]] = True
-        return mask, p, None
-    if schedule in ("shrink", "shrink_to_proximity"):
+    if schedule == "shrink":
         if anneal_steps <= 0:
             return mask_proximity, 1.0, None
         p = min(1.0, step / anneal_steps)
@@ -115,6 +70,4 @@ def pick_mask(
                     continue
                 mask[:, q, idx[:k]] = False
         return mask, p, None
-    if anneal_steps <= 0:
-        return mask_proximity, 1.0, None
-    return mask_proximity, 1.0, None
+    raise ValueError(f"Unsupported mask schedule: {schedule}. Use 'static_proximity' or 'shrink'.")
