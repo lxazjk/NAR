@@ -341,20 +341,36 @@ class Transformer(nn.Module):
         max_seq_length = find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
+        device = self.tok_embeddings.weight.device
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_head, head_dim, dtype)
+            # KVCache is created after the model is moved to GPU; explicitly place it on the same device.
+            b.attention.kv_cache = KVCache(
+                max_batch_size,
+                max_seq_length,
+                self.config.n_head,
+                head_dim,
+                dtype,
+            ).to(device)
 
         grid_size = int(self.config.block_size ** 0.5)
         assert grid_size * grid_size == self.config.block_size
-        proximity_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
+        proximity_mask = torch.tril(
+            torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool, device=device)
+        )
         low = self.cls_token_num
         high = self.cls_token_num + self.config.block_size
         self.setup_proximity_mask(
             proximity_mask[low: high, low: high], 
             self.config.block_size,
         )
+        # Keep buffers on the same device as the model for inference indexing.
         self.proximity_mask = proximity_mask.unsqueeze(0).repeat(self.max_batch_size, 1, 1)
-        self.freqs_cis = precompute_freqs_cis_2d(grid_size, self.config.dim // self.config.n_head, self.config.rope_base, self.cls_token_num)
+        self.freqs_cis = precompute_freqs_cis_2d(
+            grid_size,
+            self.config.dim // self.config.n_head,
+            self.config.rope_base,
+            self.cls_token_num,
+        ).to(device)
 
     def forward(
         self,
