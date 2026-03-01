@@ -477,10 +477,7 @@ def main(args):
                 train_steps,
                 args.mask_anneal_steps,
                 rng,
-                delta_indices=delta_indices,
                 removal_indices=removal_indices,
-                switch_step=getattr(args, "mask_switch_step", 2000),
-                prox_steps=getattr(args, "mask_prox_steps", 500),
             )
 
             # Optional: schedule-controlled HV mixing.
@@ -840,22 +837,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mask-schedule",
         type=str,
-        default="linear",
-        choices=["static_causal", "static_proximity", "static_union", "linear", "progressive", "shrink", "shrink_to_proximity", "linear_then_proximity"],
+        default="static_proximity",
+        choices=["static_proximity", "shrink"],
     )
     parser.add_argument("--mask-anneal-steps", type=int, default=20000)
-    parser.add_argument(
-        "--mask-switch-step",
-        type=int,
-        default=2000,
-        help="Anneal steps used by --mask-schedule=linear_then_proximity (UNION->PROXIMITY length).",
-    )
-    parser.add_argument(
-        "--mask-prox-steps",
-        type=int,
-        default=500,
-        help="Second phase length (UNION->PROXIMITY) used by --mask-schedule=linear_then_proximity.",
-    )
 
     # Right/Below logits mixing (learnable alpha)
     parser.add_argument("--hv-mix", action='store_true', help="enable learnable mixing between right/below logits")
