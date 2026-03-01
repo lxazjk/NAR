@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from utils.drop_path import DropPath
+import math
 
 
 def find_multiple(n: int, k: int):
@@ -50,6 +51,13 @@ class ModelArgs:
     max_seq_len: int = 2048
 
     medusa_attention_num: int = 1
+
+    # Right(head)/Below(head) mixing
+    # If enabled, learn a mixing coefficient alpha in (0,1):
+    #   logits = alpha * logitsR + (1-alpha) * logitsB
+    # This replaces the fixed 0.5/0.5 average.
+    hv_mix: bool = False
+    hv_mix_init: float = 0.5
 
 
 #################################################################################
@@ -224,7 +232,10 @@ class Attention(nn.Module):
 
         xq, xk, xv = map(lambda x: x.transpose(1, 2), (xq, xk, xv))
 
-        if self.kv_cache is not None:
+        # NOTE: during training we call the model with input_pos=None.
+        # If a previous sampling/eval call initialized KV cache, keep training safe by
+        # ignoring KV cache unless input_pos is explicitly provided.
+        if self.kv_cache is not None and input_pos is not None:
             keys, values = self.kv_cache.update(input_pos, xk, xv)
         else:
             keys, values = xk, xv
@@ -270,6 +281,23 @@ class Transformer(nn.Module):
         self.model_type = config.model_type
         self.cls_token_num = config.cls_token_num
         self.medusa_attention_num = config.medusa_attention_num
+
+        # Learnable mixing weight between right (horizontal) and below (vertical) logits.
+        # Stored as logit to keep alpha in (0,1).
+        self.hv_mix_logit = None
+        if getattr(config, "hv_mix", False):
+            p = float(getattr(config, "hv_mix_init", 0.5))
+            p = min(max(p, 1e-4), 1.0 - 1e-4)
+            init_logit = math.log(p / (1.0 - p))
+            self.hv_mix_logit = nn.Parameter(torch.tensor(init_logit, dtype=torch.float32))
+
+        # Optional training-time schedule control (set by training loop).
+        # When set, the effective right-head weight is:
+        #   w = blend * target + (1-blend) * sigmoid(hv_mix_logit)
+        # so you can start with a desired bias (e.g., vertical head dominates) and
+        # gradually hand over to the learnable weight.
+        self.hv_mix_target = None
+        self.hv_mix_blend = None
         if self.model_type == 'c2i':
             self.cls_embedding = LabelEmbedder(config.num_classes, config.dim, config.class_dropout_prob)
         elif self.model_type == 't2i':
@@ -403,12 +431,25 @@ class Transformer(nn.Module):
         medusa_h = self.medusa_norm(medusa_h)
         logitsB = self.medusa_output(medusa_h).float() # LogitsB represents the logits of the token below
 
+        # Right(head) weight in (0,1). If hv_mix is disabled, defaults to 0.5.
+        if self.hv_mix_logit is None:
+            right_w = 0.5
+        else:
+            learned_w = torch.sigmoid(self.hv_mix_logit).to(device=logitsR.device, dtype=logitsR.dtype)
+            if self.training and (self.hv_mix_target is not None) and (self.hv_mix_blend is not None):
+                t = torch.as_tensor(self.hv_mix_target, device=logitsR.device, dtype=logitsR.dtype)
+                b = torch.as_tensor(self.hv_mix_blend, device=logitsR.device, dtype=logitsR.dtype)
+                b = torch.clamp(b, 0.0, 1.0)
+                right_w = b * t + (1.0 - b) * learned_w
+            else:
+                right_w = learned_w
+
         if idx is not None and cond_idx is not None: # training
             logitsR = logitsR[:, self.cls_token_num - 1:]
             logitsB = logitsB[:, self.cls_token_num - 1:]
 
             bsz, _, emb_size = logitsR.shape
-            cond_logits = (logitsR[:, 0, :] + logitsB[:, 0, :]) / 2 # left top token prediction
+            cond_logits = logitsR[:, 0, :] * right_w + logitsB[:, 0, :] * (1 - right_w)  # left top token prediction
             logitsR = logitsR[:, 1:, :] \
                         .reshape(bsz, self.grid_size, self.grid_size, emb_size) \
                         .roll(shifts=1, dims=2)
@@ -419,17 +460,17 @@ class Transformer(nn.Module):
             logits[:, 0, 0, :] = cond_logits
             logits[:, 0, 1:, :] = logitsR[:, 0, 1:, :]
             logits[:, 1:, 0, :] = logitsB[:, 1:, 0, :]
-            logits[:, 1:, 1:, :] = (logitsR[:, 1:, 1:, :] + logitsB[:, 1:, 1:, :]) / 2
+            logits[:, 1:, 1:, :] = logitsR[:, 1:, 1:, :] * right_w + logitsB[:, 1:, 1:, :] * (1 - right_w)
             logits = logits.reshape(bsz, -1, emb_size).contiguous()
         else:
             if cond_idx is not None: # prefill in inference
                 logitsR = logitsR[:, -1:, :]
                 logitsB = logitsB[:, -1:, :]
-                logits = (logitsB + logitsR) / 2 # left top token prediction
+                logits = logitsR * right_w + logitsB * (1 - right_w) # left top token prediction
             else: # inference
                 first = logitsR[:, 0, :]
                 last = logitsB[:, -1, :]
-                middle = (logitsB[:, :-1, :] + logitsR[:, 1:, :]) / 2
+                middle = logitsR[:, 1:, :] * right_w + logitsB[:, :-1, :] * (1 - right_w)
                 if accept_first_last:
                     logits = torch.cat([first[:, None, :], middle, last[:, None, :]], dim=1)
                 else:
@@ -445,6 +486,13 @@ class Transformer(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
         return logits, loss
+
+    @torch.no_grad()
+    def get_hv_right_weight(self) -> float:
+        """Return current right(head) weight alpha in [0,1]."""
+        if self.hv_mix_logit is None:
+            return 0.5
+        return float(torch.sigmoid(self.hv_mix_logit).item())
 
     def get_fsdp_wrap_module_list(self) -> List[nn.Module]:
         return list(self.layers)

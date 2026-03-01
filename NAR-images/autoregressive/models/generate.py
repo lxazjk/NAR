@@ -8,6 +8,8 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 import torch._dynamo.config
 import torch._inductor.config
 import copy
+import os
+import sys
 from tqdm import tqdm
 # torch._inductor.config.coordinate_descent_tuning = True
 # torch._inductor.config.triton.unique_kernel_names = True
@@ -15,6 +17,34 @@ from tqdm import tqdm
 
 
 ### from https://huggingface.co/transformers/v3.2.0/_modules/transformers/generation_utils.html
+def _tqdm_disabled_by_default() -> bool:
+    """Disable tqdm when stdout/stderr is not a TTY.
+
+    This avoids `BrokenPipeError` in environments where logs are piped/closed
+    (common in multi-process training / job schedulers).
+    """
+    v = os.environ.get("TQDM_DISABLE", "").strip().lower()
+    if v in {"1", "true", "yes", "y", "on"}:
+        return True
+    try:
+        return not sys.stderr.isatty()
+    except Exception:
+        return True
+
+
+def _safe_tqdm(iterable, **kwargs):
+    """Create a tqdm iterator, but gracefully degrade on broken pipes."""
+    kwargs.setdefault("disable", _tqdm_disabled_by_default())
+    try:
+        return tqdm(iterable, **kwargs)
+    except BrokenPipeError:
+        return iterable
+    except OSError as e:
+        if getattr(e, "errno", None) == 32:
+            return iterable
+        raise
+
+
 def top_k_top_p_filtering(
     logits,
     top_k: int = 0,
@@ -126,7 +156,7 @@ def decode_n_tokens(
     generated_token_num = 1
     bias = input_pos.item()
 
-    for itera in tqdm(range(1, iteations)):
+    for itera in _safe_tqdm(range(1, iteations)):
         with sdpa_kernel(SDPBackend.MATH): # Actually better for Inductor to codegen attention here
             accept_token_num = itera + 1 if itera < grid_size else iteations - itera
             if cfg_interval > -1 and generated_token_num > cfg_interval:
