@@ -256,21 +256,30 @@ class NARModel(nn.Module):
         
         hidden_states = self.tok_dropout(token_embeddings)
         residual = None
-        # For varlen prefill (flattened tokens), `positions` is per-token and `seqlen` is 1.
-        # In that case, let NARAttention compute RoPE from positions to avoid huge broadcasts.
+        # Always prefer the precomputed 2D RoPE cache for NAR.
+        # positions can be [B, L] or flattened [N] (varlen prefill).
         freqs_cis = None
-        if positions.numel() == hidden_states.shape[1]:
-            freqs_cis = self.freqs_cis[positions.to(self.freqs_cis.device)].to(hidden_states.device)
-        
+
+        if positions is not None:
+            pos = positions.to(self.freqs_cis.device)
+            if pos.dim() == 1:
+                freqs_cis = self.freqs_cis[pos].to(hidden_states.device)
+            elif pos.dim() == 2:
+                # positions across batch are identical in NAR decoding
+                freqs_cis = self.freqs_cis[pos[0]].to(hidden_states.device)
         for i, layer in enumerate(self.layers):
-            hidden_states, residual = layer(positions, hidden_states, residual, freqs_cis, proximity_mask)
+            hidden_states, residual = layer(positions, hidden_states, residual, freqs_cis,
+        proximity_mask)
             if i == self.config.n_layer - 1:
-                medusa_hidden = hidden_states
-        
-        hidden_states, _ = self.norm(hidden_states, residual)
-        medusa_hidden, _ = self.medusa_norm(medusa_hidden, residual)
-        
-        return hidden_states, medusa_hidden
+                h_at_n = hidden_states
+                residual_at_n = residual
+
+        # logitsR: use output at n_layer
+        h_at_n, _ = self.norm(h_at_n, residual_at_n)
+        # logitsB: use output after all layers (including medusa layers)
+        medusa_hidden, _ = self.medusa_norm(hidden_states, residual)
+
+        return h_at_n, medusa_hidden
 
 
 class NARForCausalLM(nn.Module):
