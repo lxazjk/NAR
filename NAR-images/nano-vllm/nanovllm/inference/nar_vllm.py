@@ -322,217 +322,217 @@ class NARPagedLLM:
         return out
 
 
-class NARContinuousBatcher:
-    """简化版 continuous batching：允许新请求在对角 decode 过程中插入。
+# class NARContinuousBatcher:
+#     """简化版 continuous batching：允许新请求在对角 decode 过程中插入。
 
-    约束：
-    - 以“对角 step”为调度粒度；同一 step 的请求会被打成一个 batch。
-    - 每个请求占用两份 KV（cond/uncond）以支持 CFG（cfg_scale>1）。
-    - KV 采用 paged blocks，block_tables 在初始化时为每个序列预分配（不做 block sharing）。
-    """
+#     约束：
+#     - 以“对角 step”为调度粒度；同一 step 的请求会被打成一个 batch。
+#     - 每个请求占用两份 KV（cond/uncond）以支持 CFG（cfg_scale>1）。
+#     - KV 采用 paged blocks，block_tables 在初始化时为每个序列预分配（不做 block sharing）。
+#     """
 
-    def __init__(
-        self,
-        base: NARPagedLLM,
-        *,
-        max_num_requests: int,
-        sampling_params: NARSamplingParams,
-    ):
-        self.base = base
-        self.sampling_params = sampling_params
-        self.cfg_scale = float(sampling_params.cfg_scale)
-        self.max_num_requests = int(max_num_requests)
-        self.batch_size_cfg = self.max_num_requests * (2 if self.cfg_scale > 1.0 else 1)
+#     def __init__(
+#         self,
+#         base: NARPagedLLM,
+#         *,
+#         max_num_requests: int,
+#         sampling_params: NARSamplingParams,
+#     ):
+#         self.base = base
+#         self.sampling_params = sampling_params
+#         self.cfg_scale = float(sampling_params.cfg_scale)
+#         self.max_num_requests = int(max_num_requests)
+#         self.batch_size_cfg = self.max_num_requests * (2 if self.cfg_scale > 1.0 else 1)
 
-        self.max_seq_len = self.base.cls_token_num + self.base.block_size
-        _, num_blocks_per_seq = self.base._allocate_kv_cache(self.batch_size_cfg, self.max_seq_len)
-        self._global_block_tables = self.base._build_block_tables(self.batch_size_cfg, num_blocks_per_seq)
+#         self.max_seq_len = self.base.cls_token_num + self.base.block_size
+#         _, num_blocks_per_seq = self.base._allocate_kv_cache(self.batch_size_cfg, self.max_seq_len)
+#         self._global_block_tables = self.base._build_block_tables(self.batch_size_cfg, num_blocks_per_seq)
 
-        self._proximity_mask = None
-        if self.base.paged.use_proximity_mask:
-            self._proximity_mask = create_proximity_mask(
-                max_seq_length=self.max_seq_len,
-                cls_token_num=self.base.cls_token_num,
-                block_size=self.base.block_size,
-                batch_size=self.batch_size_cfg,
-                device=str(self.base.device),
-                dtype=torch.bool,
-            )
+#         self._proximity_mask = None
+#         if self.base.paged.use_proximity_mask:
+#             self._proximity_mask = create_proximity_mask(
+#                 max_seq_length=self.max_seq_len,
+#                 cls_token_num=self.base.cls_token_num,
+#                 block_size=self.base.block_size,
+#                 batch_size=self.batch_size_cfg,
+#                 device=str(self.base.device),
+#                 dtype=torch.bool,
+#             )
 
-        # Request slots
-        self._free_slots = list(range(self.max_num_requests))
-        self._active: dict[int, dict] = {}
+#         # Request slots
+#         self._free_slots = list(range(self.max_num_requests))
+#         self._active: dict[int, dict] = {}
 
-        self._iterations = 2 * self.base.grid_size - 1
+#         self._iterations = 2 * self.base.grid_size - 1
 
-    def add_requests(self, labels: torch.Tensor) -> list[int]:
-        """添加一批新请求，返回 request_ids（内部 slot id）。"""
-        labels = labels.to(device=self.base.device)
-        if labels.dtype != torch.long:
-            labels = labels.long()
+#     def add_requests(self, labels: torch.Tensor) -> list[int]:
+#         """添加一批新请求，返回 request_ids（内部 slot id）。"""
+#         labels = labels.to(device=self.base.device)
+#         if labels.dtype != torch.long:
+#             labels = labels.long()
 
-        if labels.numel() == 0:
-            return []
-        if labels.numel() > len(self._free_slots):
-            raise RuntimeError("not enough free slots for new requests")
+#         if labels.numel() == 0:
+#             return []
+#         if labels.numel() > len(self._free_slots):
+#             raise RuntimeError("not enough free slots for new requests")
 
-        slots = [self._free_slots.pop(0) for _ in range(int(labels.numel()))]
+#         slots = [self._free_slots.pop(0) for _ in range(int(labels.numel()))]
 
-        # Prefill cls token(s) for all new requests in one batch.
-        if self.cfg_scale > 1.0:
-            labels_null = torch.ones_like(labels) * self.base.num_classes
-            labels_cfg = torch.cat([labels, labels_null], dim=0)
-            rows = torch.tensor([2 * s for s in slots] + [2 * s + 1 for s in slots], device=self.base.device, dtype=torch.long)
-        else:
-            labels_cfg = labels
-            rows = torch.tensor(slots, device=self.base.device, dtype=torch.long)
+#         # Prefill cls token(s) for all new requests in one batch.
+#         if self.cfg_scale > 1.0:
+#             labels_null = torch.ones_like(labels) * self.base.num_classes
+#             labels_cfg = torch.cat([labels, labels_null], dim=0)
+#             rows = torch.tensor([2 * s for s in slots] + [2 * s + 1 for s in slots], device=self.base.device, dtype=torch.long)
+#         else:
+#             labels_cfg = labels
+#             rows = torch.tensor(slots, device=self.base.device, dtype=torch.long)
 
-        block_tables = self._global_block_tables.index_select(0, rows.to(torch.int64))
-        prox = self._proximity_mask.index_select(0, rows.to(torch.int64)) if self._proximity_mask is not None else None
+#         block_tables = self._global_block_tables.index_select(0, rows.to(torch.int64))
+#         prox = self._proximity_mask.index_select(0, rows.to(torch.int64)) if self._proximity_mask is not None else None
 
-        cls_pos = torch.zeros((rows.numel(), 1), device=self.base.device, dtype=torch.long)
-        cls_ids = labels_cfg.view(rows.numel(), 1)
-        slot_mapping = self.base._slot_mapping_from_positions(block_tables, cls_pos)
-        eff_kv = int(cls_pos.max().item()) + 1
-        set_context(
-            False,
-            slot_mapping=slot_mapping,
-            block_tables=block_tables,
-            proximity_mask=prox,
-            input_pos=cls_pos,
-            use_proximity_mask=self.base.paged.use_proximity_mask,
-            max_seqlen_k=self.max_seq_len,
-            effective_kv_len=eff_kv,
-        )
-        logitsR, logitsB = self.base.model(cls_ids, cls_pos, proximity_mask=prox)
-        reset_context()
-        prefill_logits = (logitsR[:, -1, :] + logitsB[:, -1, :]) / 2.0
+#         cls_pos = torch.zeros((rows.numel(), 1), device=self.base.device, dtype=torch.long)
+#         cls_ids = labels_cfg.view(rows.numel(), 1)
+#         slot_mapping = self.base._slot_mapping_from_positions(block_tables, cls_pos)
+#         eff_kv = int(cls_pos.max().item()) + 1
+#         set_context(
+#             False,
+#             slot_mapping=slot_mapping,
+#             block_tables=block_tables,
+#             proximity_mask=prox,
+#             input_pos=cls_pos,
+#             use_proximity_mask=self.base.paged.use_proximity_mask,
+#             max_seqlen_k=self.max_seq_len,
+#             effective_kv_len=eff_kv,
+#         )
+#         logitsR, logitsB = self.base.model(cls_ids, cls_pos, proximity_mask=prox)
+#         reset_context()
+#         prefill_logits = (logitsR[:, -1, :] + logitsB[:, -1, :]) / 2.0
 
-        if self.cfg_scale > 1.0:
-            cond_logits, uncond_logits = torch.split(prefill_logits, len(slots), dim=0)
-            logits = uncond_logits + (cond_logits - uncond_logits) * self.cfg_scale
-        else:
-            logits = prefill_logits
-        first_token = _sample_logits(
-            logits[:, None, :],
-            temperature=self.sampling_params.temperature,
-            top_k=self.sampling_params.top_k,
-            top_p=self.sampling_params.top_p,
-        )  # [B_new, 1]
+#         if self.cfg_scale > 1.0:
+#             cond_logits, uncond_logits = torch.split(prefill_logits, len(slots), dim=0)
+#             logits = uncond_logits + (cond_logits - uncond_logits) * self.cfg_scale
+#         else:
+#             logits = prefill_logits
+#         first_token = _sample_logits(
+#             logits[:, None, :],
+#             temperature=self.sampling_params.temperature,
+#             top_k=self.sampling_params.top_k,
+#             top_p=self.sampling_params.top_p,
+#         )  # [B_new, 1]
 
-        for i, s in enumerate(slots):
-            # init state
-            self._active[s] = {
-                "step": 1,  # next decode iteration index (matches NARPagedLLM loop)
-                "input_pos": [self.base.cls_token_num],
-                "cur_token": first_token[i : i + 1],  # [1, 1]
-                "slashed": [[first_token[i : i + 1]]]+[[] for _ in range(self.base.grid_size-1)],
-            }
-        return slots
+#         for i, s in enumerate(slots):
+#             # init state
+#             self._active[s] = {
+#                 "step": 1,  # next decode iteration index (matches NARPagedLLM loop)
+#                 "input_pos": [self.base.cls_token_num],
+#                 "cur_token": first_token[i : i + 1],  # [1, 1]
+#                 "slashed": [[first_token[i : i + 1]]]+[[] for _ in range(self.base.grid_size-1)],
+#             }
+#         return slots
 
-    def is_finished(self) -> bool:
-        return len(self._active) == 0
+#     def is_finished(self) -> bool:
+#         return len(self._active) == 0
 
-    @torch.no_grad()
-    def step(self):
-        """推进所有活跃请求一个对角 step（按 step 分组）。"""
-        if not self._active:
-            return []
+#     @torch.no_grad()
+#     def step(self):
+#         """推进所有活跃请求一个对角 step（按 step 分组）。"""
+#         if not self._active:
+#             return []
 
-        finished = []
-        # group by step
-        groups: dict[int, list[int]] = {}
-        for rid, st in self._active.items():
-            groups.setdefault(int(st["step"]), []).append(rid)
+#         finished = []
+#         # group by step
+#         groups: dict[int, list[int]] = {}
+#         for rid, st in self._active.items():
+#             groups.setdefault(int(st["step"]), []).append(rid)
 
-        for itera, rids in sorted(groups.items()):
-            if itera >= self._iterations:
-                # already done
-                for rid in rids:
-                    finished.append(rid)
-                continue
+#         for itera, rids in sorted(groups.items()):
+#             if itera >= self._iterations:
+#                 # already done
+#                 for rid in rids:
+#                     finished.append(rid)
+#                 continue
 
-            accept_first_last = itera < self.base.grid_size
-            # current diagonal length == len(input_pos)
-            input_pos_list = self._active[rids[0]]["input_pos"]
-            cur_len = len(input_pos_list)
+#             accept_first_last = itera < self.base.grid_size
+#             # current diagonal length == len(input_pos)
+#             input_pos_list = self._active[rids[0]]["input_pos"]
+#             cur_len = len(input_pos_list)
 
-            # Build a batch for this group
-            cur_tokens = torch.cat([self._active[r]["cur_token"] for r in rids], dim=0)  # [B, L]
+#             # Build a batch for this group
+#             cur_tokens = torch.cat([self._active[r]["cur_token"] for r in rids], dim=0)  # [B, L]
 
-            if self.cfg_scale > 1.0:
-                # duplicate tokens for cond/uncond
-                cur_tokens_cfg = torch.cat([cur_tokens, cur_tokens], dim=0)
-                rows = torch.tensor([2 * r for r in rids] + [2 * r + 1 for r in rids], device=self.base.device, dtype=torch.long)
-            else:
-                cur_tokens_cfg = cur_tokens
-                rows = torch.tensor(rids, device=self.base.device, dtype=torch.long)
+#             if self.cfg_scale > 1.0:
+#                 # duplicate tokens for cond/uncond
+#                 cur_tokens_cfg = torch.cat([cur_tokens, cur_tokens], dim=0)
+#                 rows = torch.tensor([2 * r for r in rids] + [2 * r + 1 for r in rids], device=self.base.device, dtype=torch.long)
+#             else:
+#                 cur_tokens_cfg = cur_tokens
+#                 rows = torch.tensor(rids, device=self.base.device, dtype=torch.long)
 
-            block_tables = self._global_block_tables.index_select(0, rows.to(torch.int64))
-            prox = self._proximity_mask.index_select(0, rows.to(torch.int64)) if self._proximity_mask is not None else None
+#             block_tables = self._global_block_tables.index_select(0, rows.to(torch.int64))
+#             prox = self._proximity_mask.index_select(0, rows.to(torch.int64)) if self._proximity_mask is not None else None
 
-            pos = torch.tensor(input_pos_list, device=self.base.device, dtype=torch.long)[None, :].repeat(rows.numel(), 1)
-            slot_mapping = self.base._slot_mapping_from_positions(block_tables, pos)
-            eff_kv = int(pos.max().item()) + 1
-            set_context(
-                False,
-                slot_mapping=slot_mapping,
-                block_tables=block_tables,
-                proximity_mask=prox,
-                input_pos=pos,
-                use_proximity_mask=self.base.paged.use_proximity_mask,
-                max_seqlen_k=self.max_seq_len,
-                effective_kv_len=eff_kv,
-            )
-            logitsR, logitsB = self.base.model(cur_tokens_cfg, pos, proximity_mask=prox)
-            reset_context()
+#             pos = torch.tensor(input_pos_list, device=self.base.device, dtype=torch.long)[None, :].repeat(rows.numel(), 1)
+#             slot_mapping = self.base._slot_mapping_from_positions(block_tables, pos)
+#             eff_kv = int(pos.max().item()) + 1
+#             set_context(
+#                 False,
+#                 slot_mapping=slot_mapping,
+#                 block_tables=block_tables,
+#                 proximity_mask=prox,
+#                 input_pos=pos,
+#                 use_proximity_mask=self.base.paged.use_proximity_mask,
+#                 max_seqlen_k=self.max_seq_len,
+#                 effective_kv_len=eff_kv,
+#             )
+#             logitsR, logitsB = self.base.model(cur_tokens_cfg, pos, proximity_mask=prox)
+#             reset_context()
 
-            logits_all = self.base.model.compute_logits((logitsR, logitsB), accept_first_last=accept_first_last)
-            if self.cfg_scale > 1.0:
-                cond_logits, uncond_logits = torch.split(logits_all, len(rids), dim=0)
-                logits_all = uncond_logits + (cond_logits - uncond_logits) * self.cfg_scale
+#             logits_all = self.base.model.compute_logits((logitsR, logitsB), accept_first_last=accept_first_last)
+#             if self.cfg_scale > 1.0:
+#                 cond_logits, uncond_logits = torch.split(logits_all, len(rids), dim=0)
+#                 logits_all = uncond_logits + (cond_logits - uncond_logits) * self.cfg_scale
 
-            next_token = _sample_logits(
-                logits_all,
-                temperature=self.sampling_params.temperature,
-                top_k=self.sampling_params.top_k,
-                top_p=self.sampling_params.top_p,
-            )
+#             next_token = _sample_logits(
+#                 logits_all,
+#                 temperature=self.sampling_params.temperature,
+#                 top_k=self.sampling_params.top_k,
+#                 top_p=self.sampling_params.top_p,
+#             )
 
-            # update per request
-            for i, rid in enumerate(rids):
-                st = self._active[rid]
-                st["cur_token"] = next_token[i : i + 1]
+#             # update per request
+#             for i, rid in enumerate(rids):
+#                 st = self._active[rid]
+#                 st["cur_token"] = next_token[i : i + 1]
 
-                # append into slashes
-                j = 0
-                for token_arr in st["slashed"]:
-                    if j >= st["cur_token"].shape[1]:
-                        break
-                    if len(token_arr) < self.base.grid_size:
-                        token_arr.append(st["cur_token"][:, j].view(-1, 1))
-                        j += 1
+#                 # append into slashes
+#                 j = 0
+#                 for token_arr in st["slashed"]:
+#                     if j >= st["cur_token"].shape[1]:
+#                         break
+#                     if len(token_arr) < self.base.grid_size:
+#                         token_arr.append(st["cur_token"][:, j].view(-1, 1))
+#                         j += 1
 
-                # next positions
-                next_pos = []
-                for ii in range(self.base.grid_size):
-                    jj = itera - ii
-                    if 0 <= jj < self.base.grid_size:
-                        next_pos.append(self.base.cls_token_num + ii * self.base.grid_size + jj)
-                st["input_pos"] = next_pos
-                st["step"] = itera + 1
+#                 # next positions
+#                 next_pos = []
+#                 for ii in range(self.base.grid_size):
+#                     jj = itera - ii
+#                     if 0 <= jj < self.base.grid_size:
+#                         next_pos.append(self.base.cls_token_num + ii * self.base.grid_size + jj)
+#                 st["input_pos"] = next_pos
+#                 st["step"] = itera + 1
 
-                if st["step"] >= self._iterations:
-                    finished.append(rid)
+#                 if st["step"] >= self._iterations:
+#                     finished.append(rid)
 
-        # finalize finished
-        outputs = []
-        for rid in finished:
-            st = self._active.pop(rid, None)
-            if st is None:
-                continue
-            out = torch.cat([torch.cat(arr, dim=-1) for arr in st["slashed"]], dim=-1)
-            outputs.append((rid, out))
-            self._free_slots.append(rid)
-        self._free_slots.sort()
-        return outputs
+#         # finalize finished
+#         outputs = []
+#         for rid in finished:
+#             st = self._active.pop(rid, None)
+#             if st is None:
+#                 continue
+#             out = torch.cat([torch.cat(arr, dim=-1) for arr in st["slashed"]], dim=-1)
+#             outputs.append((rid, out))
+#             self._free_slots.append(rid)
+#         self._free_slots.sort()
+#         return outputs

@@ -18,4 +18,4 @@ except Exception as exc:  # pylint: disable=broad-except
     NARLLM = _MissingLLM  # type: ignore[assignment]
 
 # New NAR backend that uses paged KV + FlexAttention.
-from nanovllm.inference.nar_vllm import NARPagedLLM, NARPagedConfig, NARContinuousBatcher
+from nanovllm.inference.nar_vllm import NARPagedLLM, NARPagedConfig
