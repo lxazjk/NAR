@@ -10,7 +10,7 @@
     --kd-weight 0 \
     --mask-schedule static_proximity \
     --fid-ref ./pretrained_models/VIRTUAL_imagenet256_labeled.npz \
-    --fid-num-samples 50000 --fid-batch-size 256 \
+    --fid-num-samples 50000 --fid-batch-size 64 \
     --fid-sample-dir samples_c2i \
     --vq-ckpt ./pretrained_models/vq_ds16_c2i.pt \
     --wandb-project c2i_nar \
