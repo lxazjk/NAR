@@ -45,22 +45,21 @@ def _sample_logits(
     top_k: int,
     top_p: float,
 ) -> torch.Tensor:
-    """Sample tokens from logits.
+    """Sample tokens from logits (vectorized across sequence dimension).
 
     logits: [B, L, V]
     returns: [B, L]
     """
     if temperature <= 0:
         raise ValueError("temperature must be > 0")
-    _, seqlen, _ = logits.shape
-    out = []
-    for i in range(seqlen):
-        one = logits[:, i, :].float() / max(float(temperature), 1e-5)
-        if top_k > 0 or top_p < 1.0:
-            one = _top_k_top_p_filtering(one, top_k=top_k, top_p=top_p)
-        probs = torch.softmax(one, dim=-1)
-        out.append(torch.multinomial(probs, num_samples=1))
-    return torch.cat(out, dim=-1)
+    B, L, V = logits.shape
+    # Flatten B*L to process all positions in one kernel launch
+    flat = logits.float().reshape(B * L, V) / max(float(temperature), 1e-5)
+    if top_k > 0 or top_p < 1.0:
+        flat = _top_k_top_p_filtering(flat, top_k=top_k, top_p=top_p)
+    probs = torch.softmax(flat, dim=-1)
+    tokens = torch.multinomial(probs, num_samples=1)
+    return tokens.view(B, L)
 
 
 @dataclass
@@ -69,6 +68,10 @@ class NARPagedConfig:
     kvcache_block_size: int = 256
     # When proximity mask is enabled, use FlexAttention.
     use_proximity_mask: bool = True
+    # Use contiguous KV cache + F.scaled_dot_product_attention instead of
+    # paged KV + FlexAttention. Much faster for NAR batch inference where all
+    # sequences advance in lockstep.
+    use_contiguous_cache: bool = True
 
 
 class NARPagedLLM:
@@ -136,6 +139,12 @@ class NARPagedLLM:
         if self._num_attn_layers <= 0:
             raise RuntimeError("Failed to find attention layers with k_cache/v_cache")
 
+        # Cached state to avoid re-allocation across generate_image calls
+        self._cached_proximity_mask: torch.Tensor | None = None
+        self._cached_proximity_mask_bs: int = 0
+        self._cached_cont_bs: int = 0
+        self._cached_cont_seqlen: int = 0
+
     def _allocate_kv_cache(self, batch_size_cfg: int, max_seq_len: int):
         num_kv_heads = self.model.config.n_kv_head or self.model.config.n_head
         head_dim = self.model.config.dim // self.model.config.n_head
@@ -163,6 +172,21 @@ class NARPagedLLM:
         base = torch.arange(batch_size_cfg, device=self.device, dtype=torch.int32)[:, None] * num_blocks_per_seq
         offs = torch.arange(num_blocks_per_seq, device=self.device, dtype=torch.int32)[None, :]
         return base + offs
+
+    def _allocate_contiguous_cache(self, batch_size: int, max_seq_len: int):
+        # Skip re-allocation if dimensions match (only zero the cache)
+        if self._cached_cont_bs >= batch_size and self._cached_cont_seqlen >= max_seq_len:
+            return
+        for m in self.model.modules():
+            if hasattr(m, 'setup_contiguous_cache'):
+                m.setup_contiguous_cache(batch_size, max_seq_len, self.dtype, self.device)
+        self._cached_cont_bs = batch_size
+        self._cached_cont_seqlen = max_seq_len
+
+    def _zero_contiguous_cache(self):
+        for m in self.model.modules():
+            if hasattr(m, 'zero_contiguous_cache'):
+                m.zero_contiguous_cache()
 
     def _slot_mapping_from_positions(self, block_tables: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # positions: [B, L] int64
@@ -198,35 +222,55 @@ class NARPagedLLM:
             cond_combined = cond
 
         max_seq_len = self.cls_token_num + self.block_size
-        _, num_blocks_per_seq = self._allocate_kv_cache(batch_size_cfg, max_seq_len)
-        block_tables = self._build_block_tables(batch_size_cfg, num_blocks_per_seq)
+        use_cont = self.paged.use_contiguous_cache
+
+        if use_cont:
+            self._allocate_contiguous_cache(batch_size_cfg, max_seq_len)
+            self._zero_contiguous_cache()
+            block_tables = None
+        else:
+            _, num_blocks_per_seq = self._allocate_kv_cache(batch_size_cfg, max_seq_len)
+            block_tables = self._build_block_tables(batch_size_cfg, num_blocks_per_seq)
 
         proximity_mask = None
         if self.paged.use_proximity_mask:
-            proximity_mask = create_proximity_mask(
-                max_seq_length=max_seq_len,
-                cls_token_num=self.cls_token_num,
-                block_size=self.block_size,
-                batch_size=batch_size_cfg,
-                device=str(self.device),
-                dtype=torch.bool,
-            )
+            if self._cached_proximity_mask is not None and self._cached_proximity_mask_bs >= batch_size_cfg:
+                proximity_mask = self._cached_proximity_mask[:batch_size_cfg]
+            else:
+                proximity_mask = create_proximity_mask(
+                    max_seq_length=max_seq_len,
+                    cls_token_num=self.cls_token_num,
+                    block_size=self.block_size,
+                    batch_size=batch_size_cfg,
+                    device=str(self.device),
+                    dtype=torch.bool,
+                )
+                self._cached_proximity_mask = proximity_mask
+                self._cached_proximity_mask_bs = batch_size_cfg
 
         # Prefill: cls token(s) at absolute position 0
         cls_pos = torch.zeros((batch_size_cfg, 1), device=self.device, dtype=torch.long)
         cls_ids = cond_combined.view(batch_size_cfg, 1)
-        slot_mapping = self._slot_mapping_from_positions(block_tables, cls_pos)
-        eff_kv = int(cls_pos.max().item()) + 1
-        set_context(
-            False,
-            slot_mapping=slot_mapping,
-            block_tables=block_tables,
-            proximity_mask=proximity_mask,
-            input_pos=cls_pos,
-            use_proximity_mask=self.paged.use_proximity_mask,
-            max_seqlen_k=max_seq_len,
-            effective_kv_len=eff_kv,
-        )
+        if use_cont:
+            set_context(
+                False,
+                proximity_mask=proximity_mask,
+                input_pos=cls_pos,
+                use_contiguous_cache=True,
+            )
+        else:
+            slot_mapping = self._slot_mapping_from_positions(block_tables, cls_pos)
+            eff_kv = int(cls_pos.max().item()) + 1
+            set_context(
+                False,
+                slot_mapping=slot_mapping,
+                block_tables=block_tables,
+                proximity_mask=proximity_mask,
+                input_pos=cls_pos,
+                use_proximity_mask=self.paged.use_proximity_mask,
+                max_seqlen_k=max_seq_len,
+                effective_kv_len=eff_kv,
+            )
         logitsR, logitsB = self.model(cls_ids, cls_pos, proximity_mask=proximity_mask)
         reset_context()
         prefill_logits = (logitsR[:, -1, :] + logitsB[:, -1, :]) / 2.0  # [B_cfg, V]
@@ -250,35 +294,58 @@ class NARPagedLLM:
         new_tokens = [[] for _ in range(self.grid_size)]
         new_tokens[0].append(cur_token)
 
-        input_pos_list = [self.cls_token_num]
         iterations = 2 * self.grid_size - 1
         generated_token_num = 1
         cfg_flag = True
 
+        # Pre-compute all diagonal position tensors to avoid Python list + torch.tensor in loop
+        G = self.grid_size
+        C = self.cls_token_num
+        all_pos_tensors: list[torch.Tensor] = []
+        pos_list = [C]  # positions for iteration 1
+        for itera in range(1, iterations):
+            t = torch.tensor(pos_list, device=self.device, dtype=torch.long)
+            all_pos_tensors.append(t.unsqueeze(0).expand(batch_size_cfg, -1))
+            # compute positions for next iteration
+            next_pos = []
+            for i in range(G):
+                j = itera - i
+                if 0 <= j < G:
+                    next_pos.append(C + i * G + j)
+            pos_list = next_pos
+
         it_range = range(1, iterations)
         if use_tqdm:
             from tqdm import tqdm
-            it_range = tqdm(it_range, desc="NAR(paged)", dynamic_ncols=True)
+            it_range = tqdm(it_range, desc="NAR(contiguous)" if use_cont else "NAR(paged)", dynamic_ncols=True)
 
         for itera in it_range:
-            accept_token_num = itera + 1 if itera < self.grid_size else iterations - itera
+            accept_token_num = itera + 1 if itera < G else iterations - itera
             if sampling_params.cfg_interval > -1 and generated_token_num > sampling_params.cfg_interval:
                 cfg_flag = False
-            accept_first_last = itera < self.grid_size
+            accept_first_last = itera < G
 
-            pos = torch.tensor(input_pos_list, device=self.device, dtype=torch.long)[None, :].repeat(batch_size_cfg, 1)
-            slot_mapping = self._slot_mapping_from_positions(block_tables, pos)
-            eff_kv = int(pos.max().item()) + 1
-            set_context(
-                False,
-                slot_mapping=slot_mapping,
-                block_tables=block_tables,
-                proximity_mask=proximity_mask,
-                input_pos=pos,
-                use_proximity_mask=self.paged.use_proximity_mask,
-                max_seqlen_k=max_seq_len,
-                effective_kv_len=eff_kv,
-            )
+            pos = all_pos_tensors[itera - 1]
+            if use_cont:
+                set_context(
+                    False,
+                    proximity_mask=proximity_mask,
+                    input_pos=pos,
+                    use_contiguous_cache=True,
+                )
+            else:
+                slot_mapping = self._slot_mapping_from_positions(block_tables, pos)
+                eff_kv = int(pos.max().item()) + 1
+                set_context(
+                    False,
+                    slot_mapping=slot_mapping,
+                    block_tables=block_tables,
+                    proximity_mask=proximity_mask,
+                    input_pos=pos,
+                    use_proximity_mask=self.paged.use_proximity_mask,
+                    max_seqlen_k=max_seq_len,
+                    effective_kv_len=eff_kv,
+                )
             logitsR, logitsB = self.model(cur_token_cfg, pos, proximity_mask=proximity_mask)
             reset_context()
 
@@ -301,20 +368,13 @@ class NARPagedLLM:
             cur_token = next_token
             cur_token_cfg = torch.cat([cur_token, cur_token], dim=0) if cfg_scale > 1.0 else cur_token
 
-            next_pos = []
-            for i in range(self.grid_size):
-                j = itera - i
-                if 0 <= j < self.grid_size:
-                    next_pos.append(self.cls_token_num + i * self.grid_size + j)
-            input_pos_list = next_pos
-
-            i = 0
+            ti = 0
             for token_arr in new_tokens:
-                if i >= cur_token.shape[1]:
+                if ti >= cur_token.shape[1]:
                     break
-                if len(token_arr) < self.grid_size:
-                    token_arr.append(cur_token[:, i].view(-1, 1))
-                    i += 1
+                if len(token_arr) < G:
+                    token_arr.append(cur_token[:, ti].view(-1, 1))
+                    ti += 1
 
             generated_token_num += accept_token_num
 
