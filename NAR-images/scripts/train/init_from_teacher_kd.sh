@@ -13,7 +13,7 @@
     --mask-schedule static_proximity \
     --fid-ref ./pretrained_models/VIRTUAL_imagenet256_labeled.npz \
     --fid-num-samples 50000 --fid-batch-size 64 \
-    --fid-sample-dir samples_c2i \
+    --fid-sample-dir /opt/tiger/NAR/NAR-images/samples_c2i \
     --vq-ckpt ./pretrained_models/vq_ds16_c2i.pt \
     --wandb-project c2i_nar \
     --wandb-name init_teacher_distill_30x2500_gptl \
