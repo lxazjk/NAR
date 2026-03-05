@@ -12,7 +12,7 @@ from multiprocessing.pool import ThreadPool
 from typing import Iterable, Optional, Tuple
 
 import sys
-sys.path.append('place the absolute path of NAR here')
+# 保持兼容，不再要求用户手动填写仓库绝对路径
 import numpy as np
 import requests
 # import tensorflow.compat.v1 as tf
@@ -22,7 +22,9 @@ from scipy import linalg
 from tqdm.auto import tqdm
 
 INCEPTION_V3_URL = "https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/classify_image_graph_def.pb"
-INCEPTION_V3_PATH = "/opt/tiger/tmp/NAR/NAR-images/pretrained_models/classify_image_graph_def.pb"
+# 将 InceptionV3 模型存放到当前仓库的 pretrained_models 目录，避免硬编码到不存在的 tmp 路径
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+INCEPTION_V3_PATH = os.path.join(_REPO_ROOT, "pretrained_models", "classify_image_graph_def.pb")
 
 FID_POOL_NAME = "pool_3:0"
 FID_SPATIAL_NAME = "mixed_6/conv:0"
