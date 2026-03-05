@@ -12,7 +12,7 @@ from multiprocessing.pool import ThreadPool
 from typing import Iterable, Optional, Tuple
 
 import sys
-sys.path.append('place the absolute path of NAR here')
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 import numpy as np
 import requests
 # import tensorflow.compat.v1 as tf

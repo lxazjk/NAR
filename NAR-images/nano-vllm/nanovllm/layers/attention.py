@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch import nn
 import triton
 import triton.language as tl
@@ -137,6 +138,26 @@ class NARAttention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self._flex_attention_compiled = None
         self._block_mask_cache = {}
+        # Contiguous KV cache buffers (allocated by setup_contiguous_cache)
+        self.cont_k_cache: torch.Tensor | None = None
+        self.cont_v_cache: torch.Tensor | None = None
+
+    def setup_contiguous_cache(self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype, device: torch.device):
+        """Allocate contiguous KV cache buffers shaped [B, num_kv_heads, T, head_dim]."""
+        self.cont_k_cache = torch.zeros(
+            max_batch_size, self.num_kv_heads, max_seq_len, self.head_dim,
+            dtype=dtype, device=device,
+        )
+        self.cont_v_cache = torch.zeros(
+            max_batch_size, self.num_kv_heads, max_seq_len, self.head_dim,
+            dtype=dtype, device=device,
+        )
+
+    def zero_contiguous_cache(self):
+        """Zero out contiguous KV cache to prevent cross-call contamination."""
+        if self.cont_k_cache is not None:
+            self.cont_k_cache.zero_()
+            self.cont_v_cache.zero_()
 
     def _get_flex_attention(self):
         if self._flex_attention_compiled is None and FLEX_ATTENTION_AVAILABLE:
@@ -252,8 +273,60 @@ class NARAttention(nn.Module):
             q, k = self._apply_rotary_emb_from_positions(positions, q, k)
         
         context = get_context()
+
+        # === Contiguous KV cache + SDPA path (matches original implementation) ===
+        if context.use_contiguous_cache and self.cont_k_cache is not None:
+            q_t = q.transpose(1, 2)  # [B, H, S, D]
+            k_t = k.transpose(1, 2)  # [B, KV_H, S, D]
+            v_t = v.transpose(1, 2)
+
+            input_pos = context.input_pos
+            if input_pos.dim() == 2:
+                input_pos = input_pos[0]  # [S] — same positions for all batch elements
+
+            # Write current K/V into contiguous cache
+            self.cont_k_cache[:bsz, :, input_pos] = k_t
+            self.cont_v_cache[:bsz, :, input_pos] = v_t
+
+            # Read cached K, V — truncated to filled region for efficiency
+            eff_kv = context.effective_kv_len
+            if eff_kv > 0:
+                keys = self.cont_k_cache[:bsz, :, :eff_kv]
+                values = self.cont_v_cache[:bsz, :, :eff_kv]
+            else:
+                keys = self.cont_k_cache[:bsz]
+                values = self.cont_v_cache[:bsz]
+
+            # GQA expansion (no-op when num_kv_heads == num_heads)
+            if self.num_kv_heads < self.num_heads:
+                keys = keys.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+                values = values.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+
+            # Proximity mask — may be pre-sliced (4D) by NARModel or full (3D)
+            mask_slice = None
+            if proximity_mask is not None:
+                if proximity_mask.dim() == 4:
+                    # Already pre-sliced as [B, 1, S, kv_len]
+                    mask_slice = proximity_mask
+                else:
+                    # Fallback: slice here
+                    if eff_kv > 0:
+                        mask_slice = proximity_mask[:bsz, None, input_pos, :eff_kv]
+                    else:
+                        mask_slice = proximity_mask[:bsz, None, input_pos]
+
+            o = F.scaled_dot_product_attention(
+                q_t, keys, values,
+                attn_mask=mask_slice,
+                is_causal=(mask_slice is None),
+            )
+            o = o.transpose(1, 2).contiguous()
+            output = self.o_proj(o.view(bsz, seqlen, -1))
+            return output
+
+        # === Paged KV cache path (original nano-vllm) ===
         k_cache, v_cache = self.k_cache, self.v_cache
-        
+
         has_kv_cache = k_cache.numel() and v_cache.numel() and context.slot_mapping is not None
         
         if has_kv_cache:

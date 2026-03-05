@@ -10,6 +10,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.layers.rotary_embedding import get_rope_2d
+from nanovllm.utils.context import get_context
 
 
 def precompute_freqs_cis_2d(grid_size: int, n_elem: int, base: int = 10000, cls_token_num: int = 1):
@@ -267,6 +268,19 @@ class NARModel(nn.Module):
             elif pos.dim() == 2:
                 # positions across batch are identical in NAR decoding
                 freqs_cis = self.freqs_cis[pos[0]].to(hidden_states.device)
+
+        # Pre-slice proximity mask once for contiguous cache path
+        # (avoids repeating the same gather in each of the 25 attention layers)
+        ctx = get_context()
+        if ctx.use_contiguous_cache and proximity_mask is not None and proximity_mask.dim() == 3 and ctx.input_pos is not None:
+            bs = hidden_states.shape[0]
+            pos_1d = ctx.input_pos[0] if ctx.input_pos.dim() == 2 else ctx.input_pos
+            eff = ctx.effective_kv_len
+            if eff > 0:
+                proximity_mask = proximity_mask[:bs, None, pos_1d, :eff]
+            else:
+                proximity_mask = proximity_mask[:bs, None, pos_1d]
+
         for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual, freqs_cis,
         proximity_mask)
