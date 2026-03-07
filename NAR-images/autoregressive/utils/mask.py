@@ -70,4 +70,9 @@ def pick_mask(
                     continue
                 mask[:, q, idx[:k]] = False
         return mask, p, None
-    raise ValueError(f"Unsupported mask schedule: {schedule}. Use 'static_proximity' or 'shrink'.")
+    if schedule == "curriculum":
+        # Phase 1: causal mask (leverage AR init), Phase 2: proximity mask
+        if anneal_steps <= 0 or step >= anneal_steps:
+            return mask_proximity, 1.0, None
+        return mask_causal, 0.0, None
+    raise ValueError(f"Unsupported mask schedule: {schedule}. Use 'static_proximity', 'shrink', or 'curriculum'.")
