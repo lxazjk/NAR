@@ -298,6 +298,12 @@ class Transformer(nn.Module):
         # gradually hand over to the learnable weight.
         self.hv_mix_target = None
         self.hv_mix_blend = None
+
+        # Split loss: compute separate CE for each head instead of on mixed logits.
+        self.split_loss = False
+        self.split_loss_lambda = 0.5   # weight for R head loss; B gets (1 - lambda)
+        self.col0_boost = 0.0          # extra weight for B head loss on column-0 tokens
+
         if self.model_type == 'c2i':
             self.cls_embedding = LabelEmbedder(config.num_classes, config.dim, config.class_dropout_prob)
         elif self.model_type == 't2i':
@@ -449,7 +455,9 @@ class Transformer(nn.Module):
             logitsB = logitsB[:, self.cls_token_num - 1:]
 
             bsz, _, emb_size = logitsR.shape
-            cond_logits = logitsR[:, 0, :] * right_w + logitsB[:, 0, :] * (1 - right_w)  # left top token prediction
+            logitsR_cond = logitsR[:, 0, :]  # raw R logit at corner (before mixing)
+            logitsB_cond = logitsB[:, 0, :]  # raw B logit at corner (before mixing)
+            cond_logits = logitsR_cond * right_w + logitsB_cond * (1 - right_w)  # left top token prediction
             logitsR = logitsR[:, 1:, :] \
                         .reshape(bsz, self.grid_size, self.grid_size, emb_size) \
                         .roll(shifts=1, dims=2)
@@ -478,7 +486,45 @@ class Transformer(nn.Module):
 
         # if we are given some desired targets also calculate the loss
         loss = None
-        if valid is not None:
+        if self.split_loss and targets is not None and idx is not None:
+            gs = self.grid_size
+            targets_2d = targets.reshape(bsz, gs, gs)
+
+            # Per-head logits in 2D grid (fill only valid positions)
+            logitsR_2d = torch.zeros(bsz, gs, gs, emb_size, device=logitsR.device, dtype=logitsR.dtype)
+            logitsR_2d[:, 0, 0, :] = logitsR_cond
+            logitsR_2d[:, 0, 1:, :] = logitsR[:, 0, 1:, :]
+            logitsR_2d[:, 1:, 1:, :] = logitsR[:, 1:, 1:, :]
+
+            logitsB_2d = torch.zeros(bsz, gs, gs, emb_size, device=logitsB.device, dtype=logitsB.dtype)
+            logitsB_2d[:, 0, 0, :] = logitsB_cond
+            logitsB_2d[:, 1:, 0, :] = logitsB[:, 1:, 0, :]
+            logitsB_2d[:, 1:, 1:, :] = logitsB[:, 1:, 1:, :]
+
+            # Per-position CE (reduction='none')
+            flat_t = targets_2d.reshape(-1)
+            ceR = F.cross_entropy(logitsR_2d.reshape(-1, emb_size), flat_t, reduction='none').reshape(bsz, gs, gs)
+            ceB = F.cross_entropy(logitsB_2d.reshape(-1, emb_size), flat_t, reduction='none').reshape(bsz, gs, gs)
+
+            # Validity masks: R invalid at col0 rows 1+, B invalid at row0 cols 1+
+            validR = torch.ones(gs, gs, device=ceR.device)
+            validR[1:, 0] = 0
+            validB = torch.ones(gs, gs, device=ceB.device)
+            validB[0, 1:] = 0
+
+            lossR = (ceR * validR).sum() / (bsz * validR.sum())
+            lossB = (ceB * validB).sum() / (bsz * validB.sum())
+
+            lam = self.split_loss_lambda
+            loss = lam * lossR + (1 - lam) * lossB
+
+            # Col0 boost: extra penalty for B head on first-column tokens
+            if self.col0_boost > 0:
+                col0_mask = torch.zeros(gs, gs, device=ceB.device)
+                col0_mask[1:, 0] = 1
+                loss_col0 = (ceB * col0_mask).sum() / (bsz * col0_mask.sum())
+                loss = loss + self.col0_boost * loss_col0
+        elif valid is not None:
             loss_all = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
             valid_all = valid[:,None].repeat(1, targets.shape[1]).view(-1)
             loss = (loss_all * valid_all).sum() / max(valid_all.sum(), 1)

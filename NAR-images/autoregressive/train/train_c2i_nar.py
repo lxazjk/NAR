@@ -420,6 +420,14 @@ def main(args):
     if args.ema:
         ema.eval()
 
+    # Set split-loss attributes on the underlying module
+    if getattr(args, "split_loss", False):
+        _core = student.module._orig_mod if (not args.no_compile) and hasattr(student.module, "_orig_mod") else student.module
+        _core.split_loss = True
+        _core.split_loss_lambda = args.split_loss_lambda
+        _core.col0_boost = args.col0_boost
+        logger.info(f"Split loss enabled: lambda={args.split_loss_lambda}, col0_boost={args.col0_boost}")
+
     # Setup FID eval (all ranks for distributed sampling)
     vq_model = None
     if args.fid_ref is not None:
@@ -841,9 +849,14 @@ if __name__ == "__main__":
         "--mask-schedule",
         type=str,
         default="static_proximity",
-        choices=["static_proximity", "shrink"],
+        choices=["static_proximity", "shrink", "curriculum"],
     )
     parser.add_argument("--mask-anneal-steps", type=int, default=20000)
+
+    # Split loss: separate CE for each head
+    parser.add_argument("--split-loss", action='store_true', help="compute separate CE loss for R and B heads")
+    parser.add_argument("--split-loss-lambda", type=float, default=0.5, help="weight for R head loss; B gets (1-lambda)")
+    parser.add_argument("--col0-boost", type=float, default=0.0, help="extra loss weight for B head on column-0 tokens")
 
     # Right/Below logits mixing (learnable alpha)
     parser.add_argument("--hv-mix", action='store_true', help="enable learnable mixing between right/below logits")
