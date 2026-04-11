@@ -59,6 +59,11 @@ class ModelArgs:
     hv_mix: bool = False
     hv_mix_init: float = 0.5
 
+    # Per-position learnable gate: MLP(proj(cat(logitsR, logitsB))) -> sigmoid.
+    # Gate input is the SAME logit pair being mixed -> train/inference consistent.
+    hv_gate: bool = False
+    hv_gate_proj_dim: int = 0  # 0 = auto (max(32, vocab_size // 512))
+
 
 #################################################################################
 #                      Embedding Layers for Class Labels                        #
@@ -291,6 +296,21 @@ class Transformer(nn.Module):
             init_logit = math.log(p / (1.0 - p))
             self.hv_mix_logit = nn.Parameter(torch.tensor(init_logit, dtype=torch.float32))
 
+        # Per-position gate MLP: input is cat(logitsR, logitsB) for the SAME target position.
+        # This ensures train/inference consistency (no position mismatch).
+        self.hv_gate_mlp = None
+        if getattr(config, "hv_gate", False):
+            _vocab = config.vocab_size
+            _proj = int(getattr(config, "hv_gate_proj_dim", 0)) or max(32, _vocab // 512)
+            self.hv_gate_mlp = nn.Sequential(
+                nn.Linear(2 * _vocab, _proj, bias=False),
+                nn.SiLU(),
+                nn.Linear(_proj, 1, bias=True),
+            )
+            # Init last layer to 0 so initial gate = sigmoid(0) = 0.5
+            nn.init.zeros_(self.hv_gate_mlp[-1].bias)
+            nn.init.zeros_(self.hv_gate_mlp[-1].weight)
+
         # Optional training-time schedule control (set by training loop).
         # When set, the effective right-head weight is:
         #   w = blend * target + (1-blend) * sigmoid(hv_mix_logit)
@@ -437,9 +457,11 @@ class Transformer(nn.Module):
         medusa_h = self.medusa_norm(medusa_h)
         logitsB = self.medusa_output(medusa_h).float() # LogitsB represents the logits of the token below
 
-        # Right(head) weight in (0,1). If hv_mix is disabled, defaults to 0.5.
+        # Right(head) weight: scalar fallback (hv_gate_mlp computes per-position after rolls).
         if self.hv_mix_logit is None:
             right_w = 0.5
+        elif self.hv_gate_mlp is not None:
+            right_w = 0.5  # will be overridden per-position after rolls
         else:
             learned_w = torch.sigmoid(self.hv_mix_logit).to(device=logitsR.device, dtype=logitsR.dtype)
             if self.training and (self.hv_mix_target is not None) and (self.hv_mix_blend is not None):
@@ -455,30 +477,66 @@ class Transformer(nn.Module):
             logitsB = logitsB[:, self.cls_token_num - 1:]
 
             bsz, _, emb_size = logitsR.shape
-            logitsR_cond = logitsR[:, 0, :]  # raw R logit at corner (before mixing)
-            logitsB_cond = logitsB[:, 0, :]  # raw B logit at corner (before mixing)
-            cond_logits = logitsR_cond * right_w + logitsB_cond * (1 - right_w)  # left top token prediction
+            gs = self.grid_size
+            logitsR_cond = logitsR[:, 0, :]  # raw R logit at corner (cls pos)
+            logitsB_cond = logitsB[:, 0, :]  # raw B logit at corner (cls pos)
+            # Corner: gate from corner logits
+            if self.hv_gate_mlp is not None:
+                _gd = self.hv_gate_mlp[0].weight.dtype
+                _corner_feat = torch.cat([logitsR_cond, logitsB_cond], dim=-1).detach().to(_gd)
+                rw_corner = torch.sigmoid(self.hv_gate_mlp(_corner_feat))  # [B, 1]
+            else:
+                rw_corner = right_w
+            cond_logits = logitsR_cond * rw_corner + logitsB_cond * (1 - rw_corner)
+            # Roll to align logits with their target positions
             logitsR = logitsR[:, 1:, :] \
-                        .reshape(bsz, self.grid_size, self.grid_size, emb_size) \
+                        .reshape(bsz, gs, gs, emb_size) \
                         .roll(shifts=1, dims=2)
             logitsB = logitsB[:, 1:, :] \
-                        .reshape(bsz, self.grid_size, self.grid_size, emb_size) \
+                        .reshape(bsz, gs, gs, emb_size) \
                         .roll(shifts=1, dims=1)
+            # Interior gate: computed AFTER roll, from same-target logitsR and logitsB
+            # -> train/inference consistent (gate always sees the two predictions for the same token)
+            if self.hv_gate_mlp is not None:
+                _gd = self.hv_gate_mlp[0].weight.dtype
+                _int_R = logitsR[:, 1:, 1:, :].reshape(bsz, -1, emb_size).detach().to(_gd)
+                _int_B = logitsB[:, 1:, 1:, :].reshape(bsz, -1, emb_size).detach().to(_gd)
+                rw_interior = torch.sigmoid(
+                    self.hv_gate_mlp(torch.cat([_int_R, _int_B], dim=-1))
+                ).reshape(bsz, gs - 1, gs - 1, 1)  # [B, gs-1, gs-1, 1]
+            else:
+                rw_interior = right_w
             logits = torch.zeros_like(logitsB)
             logits[:, 0, 0, :] = cond_logits
             logits[:, 0, 1:, :] = logitsR[:, 0, 1:, :]
             logits[:, 1:, 0, :] = logitsB[:, 1:, 0, :]
-            logits[:, 1:, 1:, :] = logitsR[:, 1:, 1:, :] * right_w + logitsB[:, 1:, 1:, :] * (1 - right_w)
+            logits[:, 1:, 1:, :] = (logitsR[:, 1:, 1:, :] * rw_interior
+                                    + logitsB[:, 1:, 1:, :] * (1 - rw_interior))
             logits = logits.reshape(bsz, -1, emb_size).contiguous()
         else:
             if cond_idx is not None: # prefill in inference
                 logitsR = logitsR[:, -1:, :]
                 logitsB = logitsB[:, -1:, :]
-                logits = logitsR * right_w + logitsB * (1 - right_w) # left top token prediction
+                if self.hv_gate_mlp is not None:
+                    _gd = self.hv_gate_mlp[0].weight.dtype
+                    _rw = torch.sigmoid(self.hv_gate_mlp(
+                        torch.cat([logitsR, logitsB], dim=-1).detach().to(_gd)
+                    ))  # [B, 1, 1]
+                else:
+                    _rw = right_w
+                logits = logitsR * _rw + logitsB * (1 - _rw) # left top token prediction
             else: # inference
                 first = logitsR[:, 0, :]
                 last = logitsB[:, -1, :]
-                middle = logitsR[:, 1:, :] * right_w + logitsB[:, :-1, :] * (1 - right_w)
+                if self.hv_gate_mlp is not None:
+                    # Gate from SAME pair being mixed: logitsR[i+1] and logitsB[i] for each target
+                    # Consistent with training where gate uses rolled logitsR[r,c] & logitsB[r,c]
+                    _gd = self.hv_gate_mlp[0].weight.dtype
+                    _pairs = torch.cat([logitsR[:, 1:, :], logitsB[:, :-1, :]], dim=-1).detach().to(_gd)
+                    _rw_mid = torch.sigmoid(self.hv_gate_mlp(_pairs))  # [B, seq-1, 1]
+                else:
+                    _rw_mid = right_w
+                middle = logitsR[:, 1:, :] * _rw_mid + logitsB[:, :-1, :] * (1 - _rw_mid)
                 if accept_first_last:
                     logits = torch.cat([first[:, None, :], middle, last[:, None, :]], dim=1)
                 else:
@@ -489,6 +547,8 @@ class Transformer(nn.Module):
         if self.split_loss and targets is not None and idx is not None:
             gs = self.grid_size
             targets_2d = targets.reshape(bsz, gs, gs)
+            ignore_index = -100
+            target_valid = (targets_2d != ignore_index).to(dtype=logitsR.dtype)
 
             # Per-head logits in 2D grid (fill only valid positions)
             logitsR_2d = torch.zeros(bsz, gs, gs, emb_size, device=logitsR.device, dtype=logitsR.dtype)
@@ -503,39 +563,68 @@ class Transformer(nn.Module):
 
             # Per-position CE (reduction='none')
             flat_t = targets_2d.reshape(-1)
-            ceR = F.cross_entropy(logitsR_2d.reshape(-1, emb_size), flat_t, reduction='none').reshape(bsz, gs, gs)
-            ceB = F.cross_entropy(logitsB_2d.reshape(-1, emb_size), flat_t, reduction='none').reshape(bsz, gs, gs)
+            ceR = F.cross_entropy(
+                logitsR_2d.reshape(-1, emb_size),
+                flat_t,
+                reduction='none',
+                ignore_index=ignore_index,
+            ).reshape(bsz, gs, gs)
+            ceB = F.cross_entropy(
+                logitsB_2d.reshape(-1, emb_size),
+                flat_t,
+                reduction='none',
+                ignore_index=ignore_index,
+            ).reshape(bsz, gs, gs)
 
             # Validity masks: R invalid at col0 rows 1+, B invalid at row0 cols 1+
-            validR = torch.ones(gs, gs, device=ceR.device)
+            validR = torch.ones(gs, gs, device=ceR.device, dtype=ceR.dtype)
             validR[1:, 0] = 0
-            validB = torch.ones(gs, gs, device=ceB.device)
+            validB = torch.ones(gs, gs, device=ceB.device, dtype=ceB.dtype)
             validB[0, 1:] = 0
 
-            lossR = (ceR * validR).sum() / (bsz * validR.sum())
-            lossB = (ceB * validB).sum() / (bsz * validB.sum())
+            weightR = validR * target_valid
+            weightB = validB * target_valid
+            denomR = weightR.sum().clamp_min(1.0)
+            denomB = weightB.sum().clamp_min(1.0)
+            lossR = (ceR * weightR).sum() / denomR
+            lossB = (ceB * weightB).sum() / denomB
 
             lam = self.split_loss_lambda
             loss = lam * lossR + (1 - lam) * lossB
 
             # Col0 boost: extra penalty for B head on first-column tokens
             if self.col0_boost > 0:
-                col0_mask = torch.zeros(gs, gs, device=ceB.device)
+                col0_mask = torch.zeros(gs, gs, device=ceB.device, dtype=ceB.dtype)
                 col0_mask[1:, 0] = 1
-                loss_col0 = (ceB * col0_mask).sum() / (bsz * col0_mask.sum())
+                col0_weight = col0_mask * target_valid
+                col0_denom = col0_weight.sum().clamp_min(1.0)
+                loss_col0 = (ceB * col0_weight).sum() / col0_denom
                 loss = loss + self.col0_boost * loss_col0
         elif valid is not None:
-            loss_all = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
-            valid_all = valid[:,None].repeat(1, targets.shape[1]).view(-1)
-            loss = (loss_all * valid_all).sum() / max(valid_all.sum(), 1)
+            flat_targets = targets.view(-1)
+            loss_all = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                flat_targets,
+                reduction='none',
+                ignore_index=-100,
+            )
+            valid_all = valid[:,None].repeat(1, targets.shape[1]).view(-1).to(dtype=loss_all.dtype)
+            valid_all = valid_all * (flat_targets != -100).to(dtype=loss_all.dtype)
+            loss = (loss_all * valid_all).sum() / valid_all.sum().clamp_min(1.0)
         elif targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-100,
+            )
 
         return logits, loss
 
     @torch.no_grad()
     def get_hv_right_weight(self) -> float:
-        """Return current right(head) weight alpha in [0,1]."""
+        """Return current right(head) weight alpha in [0,1]. For hv_gate_mlp, returns NaN (per-position)."""
+        if self.hv_gate_mlp is not None:
+            return float("nan")  # per-position gate, no single scalar
         if self.hv_mix_logit is None:
             return 0.5
         return float(torch.sigmoid(self.hv_mix_logit).item())

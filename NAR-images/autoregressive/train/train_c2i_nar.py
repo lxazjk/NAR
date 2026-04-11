@@ -183,12 +183,67 @@ def create_optimizer(model, weight_decay, learning_rate, betas, logger):
     logger.info(f"using fused AdamW: {fused_available}")
     return optimizer
 
+
+def apply_random_context_mask(
+    z_indices: torch.Tensor,
+    mask_prob: float,
+    vocab_size: int,
+    replace_mode: str,
+    mask_token_id: int,
+):
+    """
+    Randomly corrupt a subset of input image tokens to simulate noisy rollout context.
+
+    Returns:
+        input_indices: possibly corrupted token ids used as model input.
+        targets: training targets with corrupted positions set to ignore_index=-100.
+        masked_positions: bool tensor of masked positions, or None if disabled.
+        mask_ratio: fraction of masked tokens in this batch.
+    """
+    if mask_prob <= 0.0:
+        return z_indices, z_indices, None, 0.0
+
+    masked_positions = torch.rand(z_indices.shape, device=z_indices.device) < mask_prob
+    if not masked_positions.any():
+        return z_indices, z_indices, None, 0.0
+
+    # Keep at least one supervised token per sample to avoid empty-denominator edge cases.
+    all_masked = masked_positions.all(dim=1)
+    if all_masked.any():
+        masked_positions[all_masked, 0] = False
+
+    input_indices = z_indices.clone()
+    if replace_mode == "random":
+        random_tokens = torch.randint(
+            low=0,
+            high=vocab_size,
+            size=z_indices.shape,
+            device=z_indices.device,
+            dtype=z_indices.dtype,
+        )
+        input_indices = torch.where(masked_positions, random_tokens, input_indices)
+    else:
+        input_indices[masked_positions] = int(mask_token_id)
+
+    targets = z_indices.clone()
+    targets[masked_positions] = -100
+    mask_ratio = float(masked_positions.float().mean().item())
+    return input_indices, targets, masked_positions, mask_ratio
+
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
 def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
     assert args.steps_per_epoch > 0, "--steps-per-epoch must be > 0."
+    if not (0.0 <= args.random_mask_prob <= 1.0):
+        raise ValueError(f"--random-mask-prob must be in [0, 1], got {args.random_mask_prob}.")
+    if args.random_mask_replace == "mask" and not (0 <= args.random_mask_token_id < args.vocab_size):
+        raise ValueError(
+            f"--random-mask-token-id must be in [0, {args.vocab_size - 1}] "
+            f"when --random-mask-replace=mask, got {args.random_mask_token_id}."
+        )
 
     # Setup DDP
     init_distributed_mode(args)
@@ -277,6 +332,12 @@ def main(args):
 
     logger.info(f"{args}")
     logger.info(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    if rank == 0 and args.random_mask_prob > 0:
+        logger.info(
+            "Random context masking enabled: "
+            f"prob={args.random_mask_prob:.3f}, mode={args.random_mask_replace}, "
+            f"mask_token_id={args.random_mask_token_id}"
+        )
     if rank == 0:
         if args.fid_every and args.fid_every > 0:
             logger.info("Note: --fid-every is ignored; FID eval runs at the end of every epoch.")
@@ -302,6 +363,7 @@ def main(args):
         medusa_attention_num=args.medusa_attention_num,
         hv_mix=getattr(args, "hv_mix", False),
         hv_mix_init=getattr(args, "hv_mix_init", 0.5),
+        hv_gate=getattr(args, "hv_gate", False),
     ).to(device)
     logger.info(f"Student GPT Parameters: {sum(p.numel() for p in student.parameters()):,}")
 
@@ -450,6 +512,7 @@ def main(args):
     running_loss = 0.0
     running_ce = 0.0
     running_kd = 0.0
+    running_ctx_mask = 0.0
     start_time = time.time()
     start_time_all = start_time
     accum_steps = max(1, args.gradient_accumulation_steps)
@@ -464,6 +527,7 @@ def main(args):
         accum_loss = 0.0
         accum_ce = 0.0
         accum_kd = 0.0
+        accum_ctx_mask = 0.0
         epoch_steps = 0
         data_iter = iter(loader)
         while epoch_steps < steps_per_epoch:
@@ -477,6 +541,13 @@ def main(args):
             z_indices = x.reshape(x.shape[0], -1)
             c_indices = y.reshape(-1)
             assert z_indices.shape[0] == c_indices.shape[0]
+            student_indices, loss_targets, masked_positions, ctx_mask_ratio = apply_random_context_mask(
+                z_indices=z_indices,
+                mask_prob=float(args.random_mask_prob),
+                vocab_size=int(args.vocab_size),
+                replace_mode=str(args.random_mask_replace),
+                mask_token_id=int(args.random_mask_token_id),
+            )
 
             mask, mask_prob, prox_prob = pick_mask(
                 mask_causal,
@@ -519,7 +590,12 @@ def main(args):
             context = student.no_sync() if not sync else contextlib.nullcontext()
             with context:
                 with torch.cuda.amp.autocast(dtype=ptdtype):
-                    student_logits, ce_loss = student(cond_idx=c_indices, idx=z_indices, targets=z_indices, mask=mask)
+                    student_logits, ce_loss = student(
+                        cond_idx=c_indices,
+                        idx=student_indices,
+                        targets=loss_targets,
+                        mask=mask,
+                    )
                     kd_loss = torch.tensor(0.0, device=device)
                     do_kd = False
                     if teacher is not None and args.kd_weight > 0:
@@ -542,11 +618,18 @@ def main(args):
                                 input_pos=input_pos,
                             )
                         t = args.kd_temperature
-                        kd_loss = F.kl_div(
+                        kd_token = F.kl_div(
                             F.log_softmax(student_logits.float() / t, dim=-1),
                             F.softmax(teacher_logits.float() / t, dim=-1),
-                            reduction="batchmean",
-                        ) * (t * t)
+                            reduction="none",
+                        ).sum(dim=-1)
+                        if masked_positions is not None:
+                            kd_valid = (~masked_positions).to(dtype=kd_token.dtype)
+                            kd_denom = kd_valid.sum().clamp_min(1.0)
+                            kd_loss = (kd_token * kd_valid).sum() / kd_denom
+                        else:
+                            kd_loss = kd_token.mean()
+                        kd_loss = kd_loss * (t * t)
                     loss = args.ce_weight * ce_loss + args.kd_weight * kd_loss
                     loss = loss / accum_steps
                 scaler.scale(loss).backward()
@@ -554,6 +637,7 @@ def main(args):
             accum_loss += (args.ce_weight * ce_loss.item() + args.kd_weight * kd_loss.item())
             accum_ce += ce_loss.item()
             accum_kd += kd_loss.item()
+            accum_ctx_mask += ctx_mask_ratio
             micro_step += 1
 
             if sync:
@@ -571,14 +655,17 @@ def main(args):
                 step_loss_val = accum_loss / accum_steps
                 step_ce_val = accum_ce / accum_steps
                 step_kd_val = (accum_kd / accum_steps) if teacher is not None else 0.0
+                step_ctx_mask_val = accum_ctx_mask / accum_steps
 
                 # Logging
                 running_loss += step_loss_val
                 running_ce += step_ce_val
                 running_kd += step_kd_val
+                running_ctx_mask += step_ctx_mask_val
                 accum_loss = 0.0
                 accum_ce = 0.0
                 accum_kd = 0.0
+                accum_ctx_mask = 0.0
                 log_steps += 1
                 train_steps += 1
                 epoch_steps += 1
@@ -590,12 +677,15 @@ def main(args):
                 step_loss_t = torch.tensor(step_loss_val, device=device)
                 step_ce_t = torch.tensor(step_ce_val, device=device)
                 step_kd_t = torch.tensor(step_kd_val, device=device)
+                step_ctx_mask_t = torch.tensor(step_ctx_mask_val, device=device)
                 dist.all_reduce(step_loss_t, op=dist.ReduceOp.SUM)
                 dist.all_reduce(step_ce_t, op=dist.ReduceOp.SUM)
                 dist.all_reduce(step_kd_t, op=dist.ReduceOp.SUM)
+                dist.all_reduce(step_ctx_mask_t, op=dist.ReduceOp.SUM)
                 step_loss_avg = step_loss_t.item() / dist.get_world_size()
                 step_ce_avg = step_ce_t.item() / dist.get_world_size()
                 step_kd_avg = step_kd_t.item() / dist.get_world_size()
+                step_ctx_mask_avg = step_ctx_mask_t.item() / dist.get_world_size()
                 if rank == 0 and loss_writer is not None and (train_steps % args.log_loss_every == 0):
                     loss_writer.write(
                         {
@@ -605,6 +695,7 @@ def main(args):
                             "loss": step_loss_avg,
                             "ce": step_ce_avg,
                             "kd": step_kd_avg,
+                            "ctx_mask": step_ctx_mask_avg,
                             "lr": scheduler.get_last_lr()[0],
                         }
                     )
@@ -614,6 +705,7 @@ def main(args):
                                 "train/loss": step_loss_avg,
                                 "train/ce": step_ce_avg,
                                 "train/kd": step_kd_avg,
+                                "train/ctx_mask": step_ctx_mask_avg,
                                 "train/lr": scheduler.get_last_lr()[0],
                                 "train/epoch": epoch,
                                 "train/epoch_step": epoch_steps,
@@ -632,14 +724,19 @@ def main(args):
                     avg_loss = torch.tensor(running_loss / log_steps, device=device)
                     avg_ce = torch.tensor(running_ce / log_steps, device=device)
                     avg_kd = torch.tensor(running_kd / log_steps, device=device)
+                    avg_ctx_mask = torch.tensor(running_ctx_mask / log_steps, device=device)
                     dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                     dist.all_reduce(avg_ce, op=dist.ReduceOp.SUM)
                     dist.all_reduce(avg_kd, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(avg_ctx_mask, op=dist.ReduceOp.SUM)
                     avg_loss = avg_loss.item() / dist.get_world_size()
                     avg_ce = avg_ce.item() / dist.get_world_size()
                     avg_kd = avg_kd.item() / dist.get_world_size()
+                    avg_ctx_mask = avg_ctx_mask.item() / dist.get_world_size()
                     hv_info = ""
-                    if getattr(args, "hv_mix", False):
+                    if getattr(args, "hv_gate", False):
+                        pass  # per-position gate: no single scalar to log
+                    elif getattr(args, "hv_mix", False):
                         core = student.module
                         if (not args.no_compile) and hasattr(core, "_orig_mod"):
                             core = core._orig_mod
@@ -650,11 +747,13 @@ def main(args):
                         prox_info = f", ProxP: {prox_prob:.2f}"
                     logger.info(
                         f"(step={train_steps:07d}) Loss: {avg_loss:.4f}, CE: {avg_ce:.4f}, KD: {avg_kd:.4f}, "
-                        f"MaskP: {mask_prob:.2f}{prox_info}{hv_info}, Steps/Sec: {steps_per_sec:.2f}, lr: {scheduler.get_last_lr()[0]:.6f}"
+                        f"MaskP: {mask_prob:.2f}, CtxMask: {avg_ctx_mask:.3f}{prox_info}{hv_info}, "
+                        f"Steps/Sec: {steps_per_sec:.2f}, lr: {scheduler.get_last_lr()[0]:.6f}"
                     )
                     running_loss = 0.0
                     running_ce = 0.0
                     running_kd = 0.0
+                    running_ctx_mask = 0.0
                     log_steps = 0
                     start_time = time.time()
 
@@ -852,6 +951,25 @@ if __name__ == "__main__":
         choices=["static_proximity", "shrink", "curriculum"],
     )
     parser.add_argument("--mask-anneal-steps", type=int, default=20000)
+    parser.add_argument(
+        "--random-mask-prob",
+        type=float,
+        default=0.0,
+        help="Randomly replace this fraction of image input tokens to simulate noisy rollout context.",
+    )
+    parser.add_argument(
+        "--random-mask-replace",
+        type=str,
+        default="mask",
+        choices=["mask", "random"],
+        help="'mask': replace with --random-mask-token-id; 'random': replace with random visual token ids.",
+    )
+    parser.add_argument(
+        "--random-mask-token-id",
+        type=int,
+        default=0,
+        help="Replacement token id when --random-mask-replace=mask.",
+    )
 
     # Split loss: separate CE for each head
     parser.add_argument("--split-loss", action='store_true', help="compute separate CE loss for R and B heads")
@@ -874,6 +992,8 @@ if __name__ == "__main__":
         default=0,
         help="If >0, blend target->learned weight over this many steps (starts 1.0 then decays to 0.0).",
     )
+    parser.add_argument("--hv-gate", action="store_true",
+                        help="Per-position gate MLP: replaces scalar hv_mix_logit with MLP(cat(h_R,h_B))->sigmoid.")
 
     # runtime control
     parser.add_argument(
