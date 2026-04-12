@@ -51,6 +51,9 @@ class ModelArgs:
     max_seq_len: int = 2048
 
     medusa_attention_num: int = 1
+    # Backbone layer index where the vertical branch starts.
+    # <0 keeps legacy behavior: branch after the final backbone layer.
+    vertical_start_layer: int = -1
 
     # Right(head)/Below(head) mixing
     # If enabled, learn a mixing coefficient alpha in (0,1):
@@ -286,6 +289,10 @@ class Transformer(nn.Module):
         self.model_type = config.model_type
         self.cls_token_num = config.cls_token_num
         self.medusa_attention_num = config.medusa_attention_num
+        requested_vertical_start = int(getattr(config, "vertical_start_layer", -1))
+        if requested_vertical_start < 0:
+            requested_vertical_start = self.n_layer
+        self.vertical_start_layer = max(0, min(self.n_layer, requested_vertical_start))
 
         # Learnable mixing weight between right (horizontal) and below (vertical) logits.
         # Stored as logit to keep alpha in (0,1).
@@ -374,6 +381,32 @@ class Transformer(nn.Module):
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=std)
+
+    @staticmethod
+    def _binary_gate_entropy(prob: torch.Tensor) -> torch.Tensor:
+        prob = prob.clamp(1e-6, 1.0 - 1e-6)
+        entropy = -(prob * prob.log() + (1.0 - prob) * (1.0 - prob).log())
+        return entropy / math.log(2.0)
+
+    def _run_backbone_and_vertical(
+        self,
+        hidden: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        input_pos: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor],
+    ):
+        horizontal_hidden = hidden
+        vertical_source = None
+        for layer_num in range(self.n_layer):
+            if layer_num == self.vertical_start_layer:
+                vertical_source = horizontal_hidden
+            horizontal_hidden = self.layers[layer_num](horizontal_hidden, freqs_cis, input_pos, mask)
+        if vertical_source is None:
+            vertical_source = horizontal_hidden
+        vertical_hidden = vertical_source
+        for layer_num in range(self.n_layer, len(self.layers)):
+            vertical_hidden = self.layers[layer_num](vertical_hidden, freqs_cis, input_pos, mask)
+        return horizontal_hidden, vertical_hidden
     
     def setup_proximity_mask(self, mask, block_size):
         mask[:, :] = 0 # zero out visual attention mask
@@ -419,6 +452,7 @@ class Transformer(nn.Module):
         targets: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         valid: Optional[torch.Tensor] = None,
+        return_stats: bool = False,
     ):
         if idx is not None and cond_idx is not None: # training or naive inference
             cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
@@ -443,12 +477,7 @@ class Transformer(nn.Module):
         else:
             freqs_cis = self.freqs_cis[input_pos]
         # transformer blocks
-        medusa_h = h
-        for layer_num, layer in enumerate(self.layers):
-            medusa_h = layer(medusa_h, freqs_cis, input_pos, mask)
-            # hidden states for predicting Right tokens
-            if layer_num == self.n_layer - 1:
-                h = medusa_h
+        h, medusa_h = self._run_backbone_and_vertical(h, freqs_cis, input_pos, mask)
         
         # output layers
         h = self.norm(h)
@@ -472,6 +501,7 @@ class Transformer(nn.Module):
             else:
                 right_w = learned_w
 
+        gate_stats = {}
         if idx is not None and cond_idx is not None: # training
             logitsR = logitsR[:, self.cls_token_num - 1:]
             logitsB = logitsB[:, self.cls_token_num - 1:]
@@ -513,6 +543,31 @@ class Transformer(nn.Module):
             logits[:, 1:, 1:, :] = (logitsR[:, 1:, 1:, :] * rw_interior
                                     + logitsB[:, 1:, 1:, :] * (1 - rw_interior))
             logits = logits.reshape(bsz, -1, emb_size).contiguous()
+
+            if self.hv_gate_mlp is not None:
+                corner_mean = rw_corner.mean().reshape(())
+                if gs > 1:
+                    gate_mean = rw_interior.mean().reshape(())
+                    gate_entropy = self._binary_gate_entropy(rw_interior).mean().reshape(())
+                    gate_collapse = (1.0 - gate_entropy).reshape(())
+                else:
+                    gate_mean = corner_mean
+                    gate_entropy = corner_mean.new_ones(())
+                    gate_collapse = corner_mean.new_zeros(())
+            else:
+                base_gate = torch.as_tensor(right_w, device=logitsR.device, dtype=logitsR.dtype).reshape(())
+                gate_mean = base_gate
+                corner_mean = base_gate
+                gate_entropy = base_gate.new_ones(())
+                gate_collapse = base_gate.new_zeros(())
+            gate_stats = {
+                "hv_gate_h": gate_mean,
+                "hv_gate_v": (1.0 - gate_mean).reshape(()),
+                "hv_gate_h_corner": corner_mean,
+                "hv_gate_v_corner": (1.0 - corner_mean).reshape(()),
+                "hv_gate_entropy": gate_entropy,
+                "loss_gate_collapse": gate_collapse,
+            }
         else:
             if cond_idx is not None: # prefill in inference
                 logitsR = logitsR[:, -1:, :]
@@ -618,6 +673,8 @@ class Transformer(nn.Module):
                 ignore_index=-100,
             )
 
+        if return_stats:
+            return logits, loss, gate_stats
         return logits, loss
 
     @torch.no_grad()

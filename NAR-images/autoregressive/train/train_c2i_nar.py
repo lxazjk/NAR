@@ -95,16 +95,22 @@ def init_student_from_teacher(student, teacher_state, logger=None):
         if student_state["medusa_norm.weight"].shape == teacher_state["norm.weight"].shape:
             new_state["medusa_norm.weight"] = teacher_state["norm.weight"].clone()
 
-    # Reuse last teacher layer for extra medusa layers
-    base_layer = student.n_layer - 1
     extra_layers = len(student.layers) - student.n_layer
     if extra_layers > 0:
-        base_prefix = f"layers.{base_layer}."
-        for extra_id in range(student.n_layer, len(student.layers)):
+        vertical_start = int(getattr(student, "vertical_start_layer", student.n_layer))
+        if vertical_start < student.n_layer:
+            teacher_layer_ids = list(range(vertical_start, min(student.n_layer, vertical_start + extra_layers)))
+            if len(teacher_layer_ids) < extra_layers:
+                teacher_layer_ids.extend([student.n_layer - 1] * (extra_layers - len(teacher_layer_ids)))
+        else:
+            teacher_layer_ids = [student.n_layer - 1] * extra_layers
+        for rel_idx, teacher_layer_id in enumerate(teacher_layer_ids):
+            extra_id = student.n_layer + rel_idx
+            source_prefix = f"layers.{teacher_layer_id}."
             target_prefix = f"layers.{extra_id}."
             for key, val in teacher_state.items():
-                if key.startswith(base_prefix):
-                    target_key = target_prefix + key[len(base_prefix):]
+                if key.startswith(source_prefix):
+                    target_key = target_prefix + key[len(source_prefix):]
                     if target_key in student_state and student_state[target_key].shape == val.shape:
                         new_state[target_key] = val.clone()
 
@@ -121,6 +127,25 @@ def init_student_from_teacher(student, teacher_state, logger=None):
                 "Init coverage < 10%: this often means gpt-model/ckpt mismatch (e.g., GPT-B init with GPT-L ckpt), "
                 "or different key naming. Training may behave like from-scratch."
             )
+
+
+def configure_vertical_branch(student, args, logger=None):
+    requested = int(getattr(args, "vertical_start_layer", -1))
+    if getattr(args, "vertical_start_last_minus_depth", False):
+        requested = int(student.n_layer) - int(student.medusa_attention_num)
+    if requested < 0:
+        resolved = int(student.n_layer)
+    else:
+        resolved = max(0, min(int(student.n_layer), requested))
+    student.vertical_start_layer = resolved
+    if logger is not None and int(student.medusa_attention_num) > 0:
+        if resolved < int(student.n_layer):
+            logger.info(
+                f"Vertical branch start layer: {resolved} "
+                f"(depth={int(student.medusa_attention_num)}, backbone_layers={int(student.n_layer)})"
+            )
+        else:
+            logger.info("Vertical branch start layer: legacy final-backbone output.")
 
 
 def _parse_step_from_ckpt(path):
@@ -361,11 +386,15 @@ def main(args):
         drop_path_rate=args.drop_path_rate,
         token_dropout_p=args.token_dropout_p,
         medusa_attention_num=args.medusa_attention_num,
+        vertical_start_layer=args.vertical_start_layer,
         hv_mix=getattr(args, "hv_mix", False),
         hv_mix_init=getattr(args, "hv_mix_init", 0.5),
         hv_gate=getattr(args, "hv_gate", False),
     ).to(device)
+    configure_vertical_branch(student, args, logger)
     logger.info(f"Student GPT Parameters: {sum(p.numel() for p in student.parameters()):,}")
+    if getattr(args, "gate_collapse_weight", 0.0) > 0 and not getattr(args, "hv_gate", False):
+        logger.info("gate-collapse regularization requested without --hv-gate; the extra loss will stay zero.")
 
     if args.ema:
         ema = deepcopy(student).to(device)
@@ -513,11 +542,16 @@ def main(args):
     running_ce = 0.0
     running_kd = 0.0
     running_ctx_mask = 0.0
+    running_gate_collapse = 0.0
+    running_gate_entropy = 0.0
+    running_gate_h = 0.0
+    running_gate_v = 0.0
     start_time = time.time()
     start_time_all = start_time
     accum_steps = max(1, args.gradient_accumulation_steps)
     micro_step = 0
     optimizer.zero_grad(set_to_none=True)
+    need_gate_stats = bool(getattr(args, "hv_gate", False) or getattr(args, "gate_collapse_weight", 0.0) > 0.0)
 
     logger.info(f"Training for {args.epochs} epochs...")
     stop_training = False
@@ -528,6 +562,10 @@ def main(args):
         accum_ce = 0.0
         accum_kd = 0.0
         accum_ctx_mask = 0.0
+        accum_gate_collapse = 0.0
+        accum_gate_entropy = 0.0
+        accum_gate_h = 0.0
+        accum_gate_v = 0.0
         epoch_steps = 0
         data_iter = iter(loader)
         while epoch_steps < steps_per_epoch:
@@ -590,13 +628,27 @@ def main(args):
             context = student.no_sync() if not sync else contextlib.nullcontext()
             with context:
                 with torch.cuda.amp.autocast(dtype=ptdtype):
-                    student_logits, ce_loss = student(
-                        cond_idx=c_indices,
-                        idx=student_indices,
-                        targets=loss_targets,
-                        mask=mask,
-                    )
+                    if need_gate_stats:
+                        student_logits, ce_loss, gate_stats = student(
+                            cond_idx=c_indices,
+                            idx=student_indices,
+                            targets=loss_targets,
+                            mask=mask,
+                            return_stats=True,
+                        )
+                    else:
+                        student_logits, ce_loss = student(
+                            cond_idx=c_indices,
+                            idx=student_indices,
+                            targets=loss_targets,
+                            mask=mask,
+                        )
+                        gate_stats = {}
                     kd_loss = torch.tensor(0.0, device=device)
+                    gate_collapse_loss = gate_stats.get("loss_gate_collapse", torch.zeros((), device=device))
+                    gate_entropy = gate_stats.get("hv_gate_entropy", torch.ones((), device=device))
+                    gate_h = gate_stats.get("hv_gate_h", torch.full((), 0.5, device=device))
+                    gate_v = gate_stats.get("hv_gate_v", torch.full((), 0.5, device=device))
                     do_kd = False
                     if teacher is not None and args.kd_weight > 0:
                         opt_step = train_steps  # optimizer-step index (same across ranks)
@@ -630,14 +682,26 @@ def main(args):
                         else:
                             kd_loss = kd_token.mean()
                         kd_loss = kd_loss * (t * t)
-                    loss = args.ce_weight * ce_loss + args.kd_weight * kd_loss
+                    loss = (
+                        args.ce_weight * ce_loss
+                        + args.kd_weight * kd_loss
+                        + args.gate_collapse_weight * gate_collapse_loss
+                    )
                     loss = loss / accum_steps
                 scaler.scale(loss).backward()
 
-            accum_loss += (args.ce_weight * ce_loss.item() + args.kd_weight * kd_loss.item())
+            accum_loss += (
+                args.ce_weight * ce_loss.item()
+                + args.kd_weight * kd_loss.item()
+                + args.gate_collapse_weight * gate_collapse_loss.item()
+            )
             accum_ce += ce_loss.item()
             accum_kd += kd_loss.item()
             accum_ctx_mask += ctx_mask_ratio
+            accum_gate_collapse += gate_collapse_loss.item()
+            accum_gate_entropy += gate_entropy.item()
+            accum_gate_h += gate_h.item()
+            accum_gate_v += gate_v.item()
             micro_step += 1
 
             if sync:
@@ -656,16 +720,28 @@ def main(args):
                 step_ce_val = accum_ce / accum_steps
                 step_kd_val = (accum_kd / accum_steps) if teacher is not None else 0.0
                 step_ctx_mask_val = accum_ctx_mask / accum_steps
+                step_gate_collapse_val = accum_gate_collapse / accum_steps
+                step_gate_entropy_val = accum_gate_entropy / accum_steps
+                step_gate_h_val = accum_gate_h / accum_steps
+                step_gate_v_val = accum_gate_v / accum_steps
 
                 # Logging
                 running_loss += step_loss_val
                 running_ce += step_ce_val
                 running_kd += step_kd_val
                 running_ctx_mask += step_ctx_mask_val
+                running_gate_collapse += step_gate_collapse_val
+                running_gate_entropy += step_gate_entropy_val
+                running_gate_h += step_gate_h_val
+                running_gate_v += step_gate_v_val
                 accum_loss = 0.0
                 accum_ce = 0.0
                 accum_kd = 0.0
                 accum_ctx_mask = 0.0
+                accum_gate_collapse = 0.0
+                accum_gate_entropy = 0.0
+                accum_gate_h = 0.0
+                accum_gate_v = 0.0
                 log_steps += 1
                 train_steps += 1
                 epoch_steps += 1
@@ -678,14 +754,26 @@ def main(args):
                 step_ce_t = torch.tensor(step_ce_val, device=device)
                 step_kd_t = torch.tensor(step_kd_val, device=device)
                 step_ctx_mask_t = torch.tensor(step_ctx_mask_val, device=device)
+                step_gate_collapse_t = torch.tensor(step_gate_collapse_val, device=device)
+                step_gate_entropy_t = torch.tensor(step_gate_entropy_val, device=device)
+                step_gate_h_t = torch.tensor(step_gate_h_val, device=device)
+                step_gate_v_t = torch.tensor(step_gate_v_val, device=device)
                 dist.all_reduce(step_loss_t, op=dist.ReduceOp.SUM)
                 dist.all_reduce(step_ce_t, op=dist.ReduceOp.SUM)
                 dist.all_reduce(step_kd_t, op=dist.ReduceOp.SUM)
                 dist.all_reduce(step_ctx_mask_t, op=dist.ReduceOp.SUM)
+                dist.all_reduce(step_gate_collapse_t, op=dist.ReduceOp.SUM)
+                dist.all_reduce(step_gate_entropy_t, op=dist.ReduceOp.SUM)
+                dist.all_reduce(step_gate_h_t, op=dist.ReduceOp.SUM)
+                dist.all_reduce(step_gate_v_t, op=dist.ReduceOp.SUM)
                 step_loss_avg = step_loss_t.item() / dist.get_world_size()
                 step_ce_avg = step_ce_t.item() / dist.get_world_size()
                 step_kd_avg = step_kd_t.item() / dist.get_world_size()
                 step_ctx_mask_avg = step_ctx_mask_t.item() / dist.get_world_size()
+                step_gate_collapse_avg = step_gate_collapse_t.item() / dist.get_world_size()
+                step_gate_entropy_avg = step_gate_entropy_t.item() / dist.get_world_size()
+                step_gate_h_avg = step_gate_h_t.item() / dist.get_world_size()
+                step_gate_v_avg = step_gate_v_t.item() / dist.get_world_size()
                 if rank == 0 and loss_writer is not None and (train_steps % args.log_loss_every == 0):
                     loss_writer.write(
                         {
@@ -696,6 +784,10 @@ def main(args):
                             "ce": step_ce_avg,
                             "kd": step_kd_avg,
                             "ctx_mask": step_ctx_mask_avg,
+                            "gate_collapse": step_gate_collapse_avg,
+                            "gate_entropy": step_gate_entropy_avg,
+                            "hv_gate_h": step_gate_h_avg,
+                            "hv_gate_v": step_gate_v_avg,
                             "lr": scheduler.get_last_lr()[0],
                         }
                     )
@@ -706,6 +798,10 @@ def main(args):
                                 "train/ce": step_ce_avg,
                                 "train/kd": step_kd_avg,
                                 "train/ctx_mask": step_ctx_mask_avg,
+                                "train/gate_collapse": step_gate_collapse_avg,
+                                "train/gate_entropy": step_gate_entropy_avg,
+                                "train/hv_gate_h": step_gate_h_avg,
+                                "train/hv_gate_v": step_gate_v_avg,
                                 "train/lr": scheduler.get_last_lr()[0],
                                 "train/epoch": epoch,
                                 "train/epoch_step": epoch_steps,
@@ -725,17 +821,32 @@ def main(args):
                     avg_ce = torch.tensor(running_ce / log_steps, device=device)
                     avg_kd = torch.tensor(running_kd / log_steps, device=device)
                     avg_ctx_mask = torch.tensor(running_ctx_mask / log_steps, device=device)
+                    avg_gate_collapse = torch.tensor(running_gate_collapse / log_steps, device=device)
+                    avg_gate_entropy = torch.tensor(running_gate_entropy / log_steps, device=device)
+                    avg_gate_h = torch.tensor(running_gate_h / log_steps, device=device)
+                    avg_gate_v = torch.tensor(running_gate_v / log_steps, device=device)
                     dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                     dist.all_reduce(avg_ce, op=dist.ReduceOp.SUM)
                     dist.all_reduce(avg_kd, op=dist.ReduceOp.SUM)
                     dist.all_reduce(avg_ctx_mask, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(avg_gate_collapse, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(avg_gate_entropy, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(avg_gate_h, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(avg_gate_v, op=dist.ReduceOp.SUM)
                     avg_loss = avg_loss.item() / dist.get_world_size()
                     avg_ce = avg_ce.item() / dist.get_world_size()
                     avg_kd = avg_kd.item() / dist.get_world_size()
                     avg_ctx_mask = avg_ctx_mask.item() / dist.get_world_size()
+                    avg_gate_collapse = avg_gate_collapse.item() / dist.get_world_size()
+                    avg_gate_entropy = avg_gate_entropy.item() / dist.get_world_size()
+                    avg_gate_h = avg_gate_h.item() / dist.get_world_size()
+                    avg_gate_v = avg_gate_v.item() / dist.get_world_size()
                     hv_info = ""
                     if getattr(args, "hv_gate", False):
-                        pass  # per-position gate: no single scalar to log
+                        hv_info = (
+                            f", GateH: {avg_gate_h:.3f}, GateV: {avg_gate_v:.3f}, "
+                            f"GateEnt: {avg_gate_entropy:.3f}, GateCol: {avg_gate_collapse:.4f}"
+                        )
                     elif getattr(args, "hv_mix", False):
                         core = student.module
                         if (not args.no_compile) and hasattr(core, "_orig_mod"):
@@ -754,6 +865,10 @@ def main(args):
                     running_ce = 0.0
                     running_kd = 0.0
                     running_ctx_mask = 0.0
+                    running_gate_collapse = 0.0
+                    running_gate_entropy = 0.0
+                    running_gate_h = 0.0
+                    running_gate_v = 0.0
                     log_steps = 0
                     start_time = time.time()
 
@@ -896,6 +1011,17 @@ if __name__ == "__main__":
     parser.add_argument("--token-dropout-p", type=float, default=0.1)
     parser.add_argument("--drop-path-rate", type=float, default=0.0)
     parser.add_argument("--medusa-attention-num", type=int, default=1)
+    parser.add_argument(
+        "--vertical-start-layer",
+        type=int,
+        default=-1,
+        help="Backbone layer index where the vertical branch starts. <0 keeps legacy final-layer branching.",
+    )
+    parser.add_argument(
+        "--vertical-start-last-minus-depth",
+        action="store_true",
+        help="Set vertical_start_layer = n_layer - medusa_attention_num for vertical-branch ablations.",
+    )
     parser.add_argument("--no-compile", action='store_true')
     parser.add_argument("--results-dir", type=str, default="results")
 
@@ -994,6 +1120,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--hv-gate", action="store_true",
                         help="Per-position gate MLP: replaces scalar hv_mix_logit with MLP(cat(h_R,h_B))->sigmoid.")
+    parser.add_argument(
+        "--gate-collapse-weight",
+        type=float,
+        default=0.0,
+        help="Weight for hv-gate anti-collapse regularization (1 - mean binary entropy over interior gates).",
+    )
 
     # runtime control
     parser.add_argument(
