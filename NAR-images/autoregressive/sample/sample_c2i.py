@@ -17,6 +17,17 @@ from autoregressive.models.gpt import GPT_models
 from autoregressive.models.generate import generate
 
 
+def configure_vertical_branch(model, args):
+    requested = int(getattr(args, "vertical_start_layer", -1))
+    if getattr(args, "vertical_start_last_minus_depth", False):
+        requested = int(model.n_layer) - int(model.medusa_attention_num)
+    if requested < 0:
+        resolved = int(model.n_layer)
+    else:
+        resolved = max(0, min(int(model.n_layer), requested))
+    model.vertical_start_layer = resolved
+
+
 def main(args):
     # Setup PyTorch:
     torch.manual_seed(args.seed)
@@ -39,14 +50,6 @@ def main(args):
     # create and load gpt model
     precision = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.precision]
     latent_size = args.image_size // args.downsample_size
-    gpt_model = GPT_models[args.gpt_model](
-        vocab_size=args.codebook_size,
-        block_size=latent_size ** 2,
-        num_classes=args.num_classes,
-        cls_token_num=args.cls_token_num,
-        model_type=args.gpt_type,
-    ).to(device=device, dtype=precision)
-    
     checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
     if args.from_fsdp: # fspd
         model_weight = checkpoint
@@ -58,8 +61,35 @@ def main(args):
         model_weight = checkpoint["state_dict"]
     else:
         raise Exception("please check model weight, maybe add --from-fsdp to run command")
-    # if 'freqs_cis' in model_weight:
-    #     model_weight.pop('freqs_cis')
+    ckpt_args = checkpoint.get("args") if isinstance(checkpoint, dict) else None
+    has_hv_mix = isinstance(model_weight, dict) and any(("hv_mix_logit" in k) for k in model_weight.keys())
+    has_hv_gate = isinstance(model_weight, dict) and any(("hv_gate_mlp" in k) for k in model_weight.keys())
+    if ckpt_args is not None:
+        if not getattr(args, "vertical_start_last_minus_depth", False):
+            args.vertical_start_last_minus_depth = bool(getattr(ckpt_args, "vertical_start_last_minus_depth", False))
+        if int(getattr(args, "vertical_start_layer", -1)) < 0:
+            args.vertical_start_layer = int(getattr(ckpt_args, "vertical_start_layer", -1))
+        if not getattr(args, "hv_mix", False):
+            args.hv_mix = bool(getattr(ckpt_args, "hv_mix", False))
+        if not getattr(args, "hv_gate", False):
+            args.hv_gate = bool(getattr(ckpt_args, "hv_gate", False))
+    if has_hv_mix:
+        args.hv_mix = True
+    if has_hv_gate:
+        args.hv_gate = True
+
+    gpt_model = GPT_models[args.gpt_model](
+        vocab_size=args.codebook_size,
+        block_size=latent_size ** 2,
+        num_classes=args.num_classes,
+        cls_token_num=args.cls_token_num,
+        model_type=args.gpt_type,
+        hv_mix=getattr(args, "hv_mix", False),
+        hv_mix_init=getattr(args, "hv_mix_init", 0.5),
+        hv_gate=getattr(args, "hv_gate", False),
+        vertical_start_layer=args.vertical_start_layer,
+    ).to(device=device, dtype=precision)
+    configure_vertical_branch(gpt_model, args)
     gpt_model.load_state_dict(model_weight, strict=False)
     gpt_model.eval()
     del checkpoint
@@ -116,6 +146,20 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, choices=[256, 384, 512], default=384)
     parser.add_argument("--downsample-size", type=int, choices=[8, 16], default=16)
     parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--hv-mix", action='store_true', help="enable learnable mixing between right/below logits")
+    parser.add_argument("--hv-mix-init", type=float, default=0.5, help="initial right(head) weight in [0,1]")
+    parser.add_argument("--hv-gate", action='store_true', help="enable per-position hv gate")
+    parser.add_argument(
+        "--vertical-start-layer",
+        type=int,
+        default=-1,
+        help="Backbone layer index where the vertical branch starts. <0 keeps legacy final-layer branching.",
+    )
+    parser.add_argument(
+        "--vertical-start-last-minus-depth",
+        action="store_true",
+        help="Set vertical_start_layer = n_layer - medusa_attention_num for vertical-branch checkpoints.",
+    )
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--cfg-interval", type=float, default=-1)
     parser.add_argument("--seed", type=int, default=0)

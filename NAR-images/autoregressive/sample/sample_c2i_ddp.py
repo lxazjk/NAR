@@ -96,6 +96,17 @@ def apply_lora(model, target_substrings, r, alpha, dropout, train_base):
     _apply(model)
 
 
+def configure_vertical_branch(model, args):
+    requested = int(getattr(args, "vertical_start_layer", -1))
+    if getattr(args, "vertical_start_last_minus_depth", False):
+        requested = int(model.n_layer) - int(model.medusa_attention_num)
+    if requested < 0:
+        resolved = int(model.n_layer)
+    else:
+        resolved = max(0, min(int(model.n_layer), requested))
+    model.vertical_start_layer = resolved
+
+
 def create_npz_from_sample_folder(sample_dir, num=50_000):
     """
     Builds a single .npz file from a folder of .png samples.
@@ -154,10 +165,23 @@ def main(args):
     else:
         raise Exception("please check model weight, maybe add --from-fsdp to run command")
 
-    # Auto-enable HV mix if checkpoint contains the parameter.
+    ckpt_args = checkpoint.get("args") if isinstance(checkpoint, dict) else None
+    # Auto-enable optional heads if checkpoint contains the parameters.
     has_hv_mix = isinstance(model_weight, dict) and any(("hv_mix_logit" in k) for k in model_weight.keys())
+    has_hv_gate = isinstance(model_weight, dict) and any(("hv_gate_mlp" in k) for k in model_weight.keys())
+    if ckpt_args is not None:
+        if not getattr(args, "vertical_start_last_minus_depth", False):
+            args.vertical_start_last_minus_depth = bool(getattr(ckpt_args, "vertical_start_last_minus_depth", False))
+        if int(getattr(args, "vertical_start_layer", -1)) < 0:
+            args.vertical_start_layer = int(getattr(ckpt_args, "vertical_start_layer", -1))
+        if not getattr(args, "hv_mix", False):
+            args.hv_mix = bool(getattr(ckpt_args, "hv_mix", False))
+        if not getattr(args, "hv_gate", False):
+            args.hv_gate = bool(getattr(ckpt_args, "hv_gate", False))
     if has_hv_mix and not getattr(args, "hv_mix", False):
         args.hv_mix = True
+    if has_hv_gate and not getattr(args, "hv_gate", False):
+        args.hv_gate = True
 
     gpt_model = GPT_models[args.gpt_model](
         vocab_size=args.codebook_size,
@@ -167,7 +191,10 @@ def main(args):
         model_type=args.gpt_type,
         hv_mix=getattr(args, "hv_mix", False),
         hv_mix_init=getattr(args, "hv_mix_init", 0.5),
+        hv_gate=getattr(args, "hv_gate", False),
+        vertical_start_layer=args.vertical_start_layer,
     ).to(device=device, dtype=precision)
+    configure_vertical_branch(gpt_model, args)
 
     # If checkpoint contains LoRA weights, we must construct the same LoRA-wrapped modules before loading.
     has_lora = isinstance(model_weight, dict) and any((".lora_A" in k or ".lora_B" in k) for k in model_weight.keys())
@@ -271,6 +298,18 @@ if __name__ == "__main__":
     # Right/Below logits mixing (learnable alpha)
     parser.add_argument("--hv-mix", action='store_true', help="enable learnable mixing between right/below logits")
     parser.add_argument("--hv-mix-init", type=float, default=0.5, help="initial right(head) weight in [0,1]")
+    parser.add_argument("--hv-gate", action='store_true', help="enable per-position hv gate")
+    parser.add_argument(
+        "--vertical-start-layer",
+        type=int,
+        default=-1,
+        help="Backbone layer index where the vertical branch starts. <0 keeps legacy final-layer branching.",
+    )
+    parser.add_argument(
+        "--vertical-start-last-minus-depth",
+        action="store_true",
+        help="Set vertical_start_layer = n_layer - medusa_attention_num for vertical-branch checkpoints.",
+    )
 
     # LoRA (needed when sampling from LoRA-trained checkpoints)
     parser.add_argument("--use-lora", action='store_true', help="Enable LoRA module wrapping before loading ckpt")
