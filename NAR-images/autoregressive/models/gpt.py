@@ -6,6 +6,7 @@
 #   gpt-fast: https://github.com/pytorch-labs/gpt-fast/blob/main/model.py
 #   PixArt:   https://github.com/PixArt-alpha/PixArt-alpha/blob/master/diffusion/model/nets/PixArt_blocks.py
 from dataclasses import dataclass
+import contextlib
 from typing import Optional, List
 
 
@@ -372,6 +373,11 @@ class Transformer(nn.Module):
 
         # Zero-out output layers:
         nn.init.constant_(self.output.weight, 0)
+        if self.hv_gate_mlp is not None:
+            gate_std = 1.0 / math.sqrt(2.0 * float(self.vocab_size))
+            nn.init.normal_(self.hv_gate_mlp[0].weight, mean=0.0, std=gate_std)
+            nn.init.zeros_(self.hv_gate_mlp[-1].bias)
+            nn.init.zeros_(self.hv_gate_mlp[-1].weight)
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -387,6 +393,18 @@ class Transformer(nn.Module):
         prob = prob.clamp(1e-6, 1.0 - 1e-6)
         entropy = -(prob * prob.log() + (1.0 - prob) * (1.0 - prob).log())
         return entropy / math.log(2.0)
+
+    def _hv_gate(self, logits_h: torch.Tensor, logits_v: torch.Tensor) -> torch.Tensor:
+        features = torch.cat([logits_h.detach().float(), logits_v.detach().float()], dim=-1)
+        features = torch.nan_to_num(features, nan=0.0, posinf=30.0, neginf=-30.0)
+        mean = features.mean(dim=-1, keepdim=True)
+        centered = features - mean
+        rms = centered.pow(2).mean(dim=-1, keepdim=True).clamp_min(1e-6).sqrt()
+        features = (centered / rms).clamp(-6.0, 6.0)
+        autocast_ctx = torch.cuda.amp.autocast(enabled=False) if features.is_cuda else contextlib.nullcontext()
+        with autocast_ctx:
+            gate_logits = self.hv_gate_mlp(features.to(dtype=self.hv_gate_mlp[0].weight.dtype))
+        return torch.sigmoid(gate_logits).to(dtype=logits_h.dtype)
 
     def _run_backbone_and_vertical(
         self,
@@ -512,9 +530,7 @@ class Transformer(nn.Module):
             logitsB_cond = logitsB[:, 0, :]  # raw B logit at corner (cls pos)
             # Corner: gate from corner logits
             if self.hv_gate_mlp is not None:
-                _gd = self.hv_gate_mlp[0].weight.dtype
-                _corner_feat = torch.cat([logitsR_cond, logitsB_cond], dim=-1).detach().to(_gd)
-                rw_corner = torch.sigmoid(self.hv_gate_mlp(_corner_feat))  # [B, 1]
+                rw_corner = self._hv_gate(logitsR_cond, logitsB_cond)  # [B, 1]
             else:
                 rw_corner = right_w
             cond_logits = logitsR_cond * rw_corner + logitsB_cond * (1 - rw_corner)
@@ -528,12 +544,9 @@ class Transformer(nn.Module):
             # Interior gate: computed AFTER roll, from same-target logitsR and logitsB
             # -> train/inference consistent (gate always sees the two predictions for the same token)
             if self.hv_gate_mlp is not None:
-                _gd = self.hv_gate_mlp[0].weight.dtype
-                _int_R = logitsR[:, 1:, 1:, :].reshape(bsz, -1, emb_size).detach().to(_gd)
-                _int_B = logitsB[:, 1:, 1:, :].reshape(bsz, -1, emb_size).detach().to(_gd)
-                rw_interior = torch.sigmoid(
-                    self.hv_gate_mlp(torch.cat([_int_R, _int_B], dim=-1))
-                ).reshape(bsz, gs - 1, gs - 1, 1)  # [B, gs-1, gs-1, 1]
+                _int_R = logitsR[:, 1:, 1:, :].reshape(bsz, -1, emb_size)
+                _int_B = logitsB[:, 1:, 1:, :].reshape(bsz, -1, emb_size)
+                rw_interior = self._hv_gate(_int_R, _int_B).reshape(bsz, gs - 1, gs - 1, 1)  # [B, gs-1, gs-1, 1]
             else:
                 rw_interior = right_w
             logits = torch.zeros_like(logitsB)
@@ -573,10 +586,7 @@ class Transformer(nn.Module):
                 logitsR = logitsR[:, -1:, :]
                 logitsB = logitsB[:, -1:, :]
                 if self.hv_gate_mlp is not None:
-                    _gd = self.hv_gate_mlp[0].weight.dtype
-                    _rw = torch.sigmoid(self.hv_gate_mlp(
-                        torch.cat([logitsR, logitsB], dim=-1).detach().to(_gd)
-                    ))  # [B, 1, 1]
+                    _rw = self._hv_gate(logitsR, logitsB)  # [B, 1, 1]
                 else:
                     _rw = right_w
                 logits = logitsR * _rw + logitsB * (1 - _rw) # left top token prediction
@@ -586,9 +596,7 @@ class Transformer(nn.Module):
                 if self.hv_gate_mlp is not None:
                     # Gate from SAME pair being mixed: logitsR[i+1] and logitsB[i] for each target
                     # Consistent with training where gate uses rolled logitsR[r,c] & logitsB[r,c]
-                    _gd = self.hv_gate_mlp[0].weight.dtype
-                    _pairs = torch.cat([logitsR[:, 1:, :], logitsB[:, :-1, :]], dim=-1).detach().to(_gd)
-                    _rw_mid = torch.sigmoid(self.hv_gate_mlp(_pairs))  # [B, seq-1, 1]
+                    _rw_mid = self._hv_gate(logitsR[:, 1:, :], logitsB[:, :-1, :])  # [B, seq-1, 1]
                 else:
                     _rw_mid = right_w
                 middle = logitsR[:, 1:, :] * _rw_mid + logitsB[:, :-1, :] * (1 - _rw_mid)

@@ -166,3 +166,5 @@ imagenet/
 *.txt
 *.npz
 *.pb
+
+logs/

@@ -364,8 +364,11 @@ def main(args):
             f"mask_token_id={args.random_mask_token_id}"
         )
     if rank == 0:
-        if args.fid_every and args.fid_every > 0:
-            logger.info("Note: --fid-every is ignored; FID eval runs at the end of every epoch.")
+        if args.fid_ref is not None:
+            if args.fid_every and args.fid_every > 0:
+                logger.info(f"FID eval interval: every {args.fid_every} epoch(s).")
+            else:
+                logger.info("FID eval interval: every epoch.")
         if args.ckpt_every and args.ckpt_every > 0:
             logger.info("Note: --ckpt-every is ignored; only last_version.pt is kept (overwritten each epoch).")
 
@@ -875,8 +878,17 @@ def main(args):
             if stop_training:
                 break
         scheduler.step()
-        # Epoch-end FID evaluation (rank0 runs, others wait)
-        if args.fid_ref is not None:
+        # Epoch-end FID evaluation (all ranks participate in distributed sampling).
+        fid_every = int(getattr(args, "fid_every", 0))
+        should_run_fid = (
+            args.fid_ref is not None
+            and (
+                fid_every <= 0
+                or ((epoch + 1) % fid_every == 0)
+                or (epoch + 1 == args.epochs)
+            )
+        )
+        if should_run_fid:
             fid_ok = torch.tensor(1, device=device, dtype=torch.int32)
             npz_path = None
             txt_path = None
@@ -1136,7 +1148,7 @@ if __name__ == "__main__":
     )
 
     # fid evaluation
-    parser.add_argument("--fid-every", type=int, default=0, help="ignored; eval runs at the end of every epoch")
+    parser.add_argument("--fid-every", type=int, default=0, help="Run FID every N epochs. 0 means every epoch.")
     parser.add_argument("--fid-ref", type=str, default=None)
     parser.add_argument("--fid-num-samples", type=int, default=50000)
     parser.add_argument("--fid-batch-size", type=int, default=32)
@@ -1157,7 +1169,7 @@ if __name__ == "__main__":
     parser.add_argument("--fid-top-k", type=int, default=0)
     parser.add_argument("--fid-top-p", type=float, default=1.0)
     parser.add_argument("--fid-temperature", type=float, default=1.0)
-    parser.add_argument("--fid-cfg-scale", type=float, default=1.5)
+    parser.add_argument("--fid-cfg-scale", type=float, default=2.0)
     parser.add_argument("--fid-cfg-interval", type=float, default=-1)
     parser.add_argument("--vq-model", type=str, choices=list(VQ_models.keys()), default="VQ-16")
     parser.add_argument("--vq-ckpt", type=str, default=None)
