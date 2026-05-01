@@ -174,6 +174,8 @@ def main(args):
             args.vertical_start_last_minus_depth = bool(getattr(ckpt_args, "vertical_start_last_minus_depth", False))
         if int(getattr(args, "vertical_start_layer", -1)) < 0:
             args.vertical_start_layer = int(getattr(ckpt_args, "vertical_start_layer", -1))
+        if int(getattr(args, "medusa_attention_num", -1)) < 0:
+            args.medusa_attention_num = int(getattr(ckpt_args, "medusa_attention_num", 1))
         if not getattr(args, "hv_mix", False):
             args.hv_mix = bool(getattr(ckpt_args, "hv_mix", False))
         if not getattr(args, "hv_gate", False):
@@ -192,6 +194,7 @@ def main(args):
         hv_mix=getattr(args, "hv_mix", False),
         hv_mix_init=getattr(args, "hv_mix_init", 0.5),
         hv_gate=getattr(args, "hv_gate", False),
+        medusa_attention_num=args.medusa_attention_num,
         vertical_start_layer=args.vertical_start_layer,
     ).to(device=device, dtype=precision)
     configure_vertical_branch(gpt_model, args)
@@ -299,6 +302,7 @@ if __name__ == "__main__":
     parser.add_argument("--hv-mix", action='store_true', help="enable learnable mixing between right/below logits")
     parser.add_argument("--hv-mix-init", type=float, default=0.5, help="initial right(head) weight in [0,1]")
     parser.add_argument("--hv-gate", action='store_true', help="enable per-position hv gate")
+    parser.add_argument("--medusa-attention-num", type=int, default=-1, help="Number of extra Transformer blocks before the vertical head. -1 reads from checkpoint args.")
     parser.add_argument(
         "--vertical-start-layer",
         type=int,
@@ -330,7 +334,7 @@ if __name__ == "__main__":
     parser.add_argument("--image-size-eval", type=int, choices=[256, 384, 512], default=256)
     parser.add_argument("--downsample-size", type=int, choices=[8, 16], default=16)
     parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--cfg-scale",  type=float, default=1.5)
+    parser.add_argument("--cfg-scale",  type=float, default=2.0)
     parser.add_argument("--cfg-interval", type=float, default=-1)
     parser.add_argument("--sample-dir", type=str, default="samples")
     parser.add_argument("--per-proc-batch-size", type=int, default=32)
