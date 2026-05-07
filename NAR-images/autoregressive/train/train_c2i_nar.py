@@ -69,8 +69,10 @@ def normalize_state_dict(state):
 def load_checkpoint(path, map_location="cpu"):
     if path is None:
         return None
-    ckpt = torch.load(path, map_location=map_location)
-    return ckpt
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
 
 
 def init_student_from_teacher(student, teacher_state, logger=None):
@@ -209,6 +211,84 @@ def create_optimizer(model, weight_decay, learning_rate, betas, logger):
     return optimizer
 
 
+def unwrap_model(model):
+    if isinstance(model, DDP):
+        model = model.module
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+    return model
+
+
+def get_phase_trainable_names(model, scope):
+    scope = str(scope or "full")
+    raw_model = unwrap_model(model)
+    if scope == "full":
+        return None
+    if scope == "none":
+        return set()
+
+    vertical_head_prefixes = (
+        "medusa_norm.",
+        "medusa_output.",
+        "hv_gate_mlp.",
+        "hv_mix_logit",
+    )
+    extra_start = int(getattr(raw_model, "n_layer", 0))
+    names = set()
+    for name, _ in raw_model.named_parameters():
+        is_vertical_head = name.startswith(vertical_head_prefixes)
+        is_extra_layer = False
+        if name.startswith("layers."):
+            parts = name.split(".", 2)
+            if len(parts) > 1 and parts[1].isdigit():
+                is_extra_layer = int(parts[1]) >= extra_start
+        if scope == "vertical_head" and is_vertical_head:
+            names.add(name)
+        elif scope == "vertical_extra" and (is_vertical_head or is_extra_layer):
+            names.add(name)
+    if scope not in {"vertical_head", "vertical_extra"}:
+        raise ValueError(f"Unknown --phase1-train-scope: {scope}")
+    return names
+
+
+def log_trainable_scope(model, trainable_names, scope, logger):
+    raw_model = unwrap_model(model)
+    total = 0
+    trainable = 0
+    tensors = 0
+    for name, param in raw_model.named_parameters():
+        n = int(param.numel())
+        total += n
+        if trainable_names is None or name in trainable_names:
+            trainable += n
+            tensors += 1
+    logger.info(
+        f"Train phase scope={scope}: updating {tensors} tensors, "
+        f"{trainable:,}/{total:,} params ({100.0 * trainable / max(total, 1):.2f}%)."
+    )
+
+
+def mask_nontrainable_grads(model, trainable_names):
+    if trainable_names is None:
+        return
+    raw_model = unwrap_model(model)
+    for name, param in raw_model.named_parameters():
+        if name not in trainable_names:
+            param.grad = None
+
+
+def kd_allowed(args, epoch, train_steps):
+    if args.kd_weight <= 0:
+        return False
+    kd_end_epoch = int(getattr(args, "kd_end_epoch", -1))
+    if kd_end_epoch >= 0 and epoch >= kd_end_epoch:
+        return False
+    kd_end_step = int(getattr(args, "kd_end_step", -1))
+    if kd_end_step >= 0 and train_steps >= kd_end_step:
+        return False
+    return True
+
+
 def apply_random_context_mask(
     z_indices: torch.Tensor,
     mask_prob: float,
@@ -321,6 +401,12 @@ def main(args):
     if rank == 0:
         if experiment_dir is not None and not os.path.isabs(args.fid_sample_dir):
             args.fid_sample_dir = os.path.join(experiment_dir, args.fid_sample_dir)
+
+    fid_sample_dir_obj = [args.fid_sample_dir if rank == 0 else None]
+    dist.broadcast_object_list(fid_sample_dir_obj, src=0)
+    args.fid_sample_dir = fid_sample_dir_obj[0]
+
+    if rank == 0:
         metrics_dir = os.path.join(experiment_dir, "metrics")
         loss_writer = JsonlWriter(os.path.join(metrics_dir, "train_loss_steps.jsonl"))
         eval_writer = JsonlWriter(os.path.join(metrics_dir, "eval_metrics.jsonl"))
@@ -540,6 +626,10 @@ def main(args):
     scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision == 'fp16'))
 
     # Training loop
+    active_phase_scope = None
+    active_trainable_names = None
+    phase1_epochs = int(getattr(args, "phase1_epochs", 0))
+    phase1_scope = str(getattr(args, "phase1_train_scope", "full"))
     log_steps = 0
     running_loss = 0.0
     running_ce = 0.0
@@ -561,6 +651,18 @@ def main(args):
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
+        desired_phase_scope = phase1_scope if epoch < phase1_epochs else "full"
+        if desired_phase_scope != active_phase_scope:
+            active_phase_scope = desired_phase_scope
+            active_trainable_names = get_phase_trainable_names(student, active_phase_scope)
+            log_trainable_scope(student, active_trainable_names, active_phase_scope, logger)
+            optimizer.zero_grad(set_to_none=True)
+
+        if teacher is not None and not kd_allowed(args, epoch, train_steps):
+            teacher = None
+            torch.cuda.empty_cache()
+            logger.info(f"KD disabled from epoch={epoch}, step={train_steps}; released teacher model.")
+
         accum_loss = 0.0
         accum_ce = 0.0
         accum_kd = 0.0
@@ -653,7 +755,7 @@ def main(args):
                     gate_h = gate_stats.get("hv_gate_h", torch.full((), 0.5, device=device))
                     gate_v = gate_stats.get("hv_gate_v", torch.full((), 0.5, device=device))
                     do_kd = False
-                    if teacher is not None and args.kd_weight > 0:
+                    if teacher is not None and kd_allowed(args, epoch, train_steps):
                         opt_step = train_steps  # optimizer-step index (same across ranks)
                         if opt_step >= args.kd_start_step and (args.kd_every <= 1 or (opt_step % args.kd_every == 0)):
                             if args.kd_prob >= 1.0:
@@ -708,8 +810,9 @@ def main(args):
             micro_step += 1
 
             if sync:
+                scaler.unscale_(optimizer)
+                mask_nontrainable_grads(student, active_trainable_names)
                 if args.max_grad_norm != 0.0:
-                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(student.parameters(), args.max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
@@ -1061,7 +1164,17 @@ if __name__ == "__main__":
         help="Start applying KD from this optimizer step (warmup without KD).",
     )
     parser.add_argument("--kd-temperature", type=float, default=1.0)
+    parser.add_argument("--kd-end-step", type=int, default=-1, help="Stop applying KD at this optimizer step. -1 means no step cutoff.")
+    parser.add_argument("--kd-end-epoch", type=int, default=-1, help="Stop applying KD from this epoch onward. -1 means no epoch cutoff.")
     parser.add_argument("--ce-weight", type=float, default=1.0)
+    parser.add_argument("--phase1-epochs", type=int, default=0, help="Number of initial epochs with restricted update scope.")
+    parser.add_argument(
+        "--phase1-train-scope",
+        type=str,
+        default="full",
+        choices=["full", "none", "vertical_head", "vertical_extra"],
+        help="Params updated during phase1: vertical_head=head/gate, vertical_extra=head/gate+extra Transformer layers.",
+    )
 
     # optimization
     parser.add_argument("--ema", action='store_true')

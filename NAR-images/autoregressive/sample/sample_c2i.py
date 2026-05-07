@@ -11,6 +11,7 @@ from torchvision.utils import save_image
 import time
 import argparse
 import sys
+from pathlib import Path
 sys.path.append('place the absolute path of NAR-images here')
 from tokenizer.tokenizer_image.vq_model import VQ_models
 from autoregressive.models.gpt import GPT_models
@@ -59,6 +60,8 @@ def main(args):
         model_weight = checkpoint["module"]
     elif "state_dict" in checkpoint:
         model_weight = checkpoint["state_dict"]
+    elif isinstance(checkpoint, dict):
+        model_weight = checkpoint
     else:
         raise Exception("please check model weight, maybe add --from-fsdp to run command")
     ckpt_args = checkpoint.get("args") if isinstance(checkpoint, dict) else None
@@ -109,7 +112,10 @@ def main(args):
         print(f"no need to compile model in demo") 
 
     # Labels to condition the model with (feel free to change):
-    class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
+    if args.class_labels:
+        class_labels = [int(x) for x in args.class_labels.replace(",", " ").split()]
+    else:
+        class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
     c_indices = torch.tensor(class_labels, device=device)
     qzshape = [len(class_labels), args.codebook_embed_dim, latent_size, latent_size]
 
@@ -129,8 +135,19 @@ def main(args):
     print(f"decoder takes about {decoder_time:.2f} seconds.")
 
     # Save and display images:
-    save_image(samples, "sample_{}.png".format(args.gpt_type), nrow=4, normalize=True, value_range=(-1, 1))
-    print(f"image is saved to sample_{args.gpt_type}.png")
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    grid_path = output_dir / args.output_name
+    save_image(samples, grid_path, nrow=args.nrow, normalize=True, value_range=(-1, 1))
+    for class_id, sample in zip(class_labels, samples):
+        save_image(
+            sample,
+            output_dir / f"class_{class_id}.png",
+            normalize=True,
+            value_range=(-1, 1),
+        )
+    print(f"image grid is saved to {grid_path}")
+    print(f"individual images are saved to {output_dir}")
 
 
 if __name__ == "__main__":
@@ -166,6 +183,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--cfg-scale", type=float, default=2.0)
     parser.add_argument("--cfg-interval", type=float, default=-1)
+    parser.add_argument("--class-labels", type=str, default="", help="space/comma-separated ImageNet class ids")
+    parser.add_argument("--output-dir", type=str, default="samples_c2i", help="directory to save generated images")
+    parser.add_argument("--output-name", type=str, default="sample_c2i.png", help="grid image filename")
+    parser.add_argument("--nrow", type=int, default=4, help="number of images per row in the saved grid")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=2000,help="top-k value to sample with")
     parser.add_argument("--temperature", type=float, default=1.0, help="temperature value to sample with")

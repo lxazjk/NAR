@@ -153,7 +153,10 @@ def main(args):
     latent_size = args.image_size // args.downsample_size
 
     # Load checkpoint first to auto-detect optional modules.
-    checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
+    try:
+        checkpoint = torch.load(args.gpt_ckpt, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
     if args.from_fsdp: # fsdp
         model_weight = checkpoint
     elif "model" in checkpoint:  # ddp

@@ -7,6 +7,7 @@
 #   PixArt:   https://github.com/PixArt-alpha/PixArt-alpha/blob/master/diffusion/model/nets/PixArt_blocks.py
 from dataclasses import dataclass
 import contextlib
+import os
 from typing import Optional, List
 
 
@@ -16,6 +17,51 @@ from torch.nn import functional as F
 from utils.drop_path import DropPath
 import math
 
+
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+_COMPILED_FLEX_ATTENTION = None
+_CREATE_BLOCK_MASK = None
+_FLEX_IMPORT_ERROR = None
+
+
+def _get_flex_attention_ops():
+    global _COMPILED_FLEX_ATTENTION, _CREATE_BLOCK_MASK, _FLEX_IMPORT_ERROR
+    if _COMPILED_FLEX_ATTENTION is not None and _CREATE_BLOCK_MASK is not None:
+        return _COMPILED_FLEX_ATTENTION, _CREATE_BLOCK_MASK
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+        _COMPILED_FLEX_ATTENTION = torch.compile(flex_attention, dynamic=False)
+        _CREATE_BLOCK_MASK = create_block_mask
+        return _COMPILED_FLEX_ATTENTION, _CREATE_BLOCK_MASK
+    except Exception as exc:
+        _FLEX_IMPORT_ERROR = exc
+        return None, None
+
+
+def _dense_mask_to_flex_block_mask(mask: torch.Tensor):
+    _, create_block_mask = _get_flex_attention_ops()
+    if create_block_mask is None:
+        return mask
+    dense_mask = mask.squeeze(1).contiguous()
+    batch_size, query_len, kv_len = dense_mask.shape
+
+    def mask_mod(batch, head, query_idx, kv_idx):
+        return dense_mask[batch, query_idx, kv_idx]
+
+    return create_block_mask(
+        mask_mod,
+        B=batch_size,
+        H=None,
+        Q_LEN=query_len,
+        KV_LEN=kv_len,
+        device=dense_mask.device,
+        BLOCK_SIZE=(1, 64),
+    )
 
 def find_multiple(n: int, k: int):
     if n % k == 0:
@@ -251,11 +297,15 @@ class Attention(nn.Module):
         keys = keys.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
         values = values.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
 
-        output = F.scaled_dot_product_attention(
-            xq, keys, values, 
-            attn_mask=mask, 
-            is_causal=True if mask is None else False, # is_causal=False is for KV cache
-            dropout_p=self.attn_dropout_p if self.training else 0)            
+        flex_attention, _ = _get_flex_attention_ops() if _env_flag("NAR_USE_FLEX_ATTENTION") else (None, None)
+        if flex_attention is not None and mask is not None and not self.training:
+            output = flex_attention(xq, keys, values, block_mask=mask)
+        else:
+            output = F.scaled_dot_product_attention(
+                xq, keys, values, 
+                attn_mask=mask, 
+                is_causal=True if mask is None else False, # is_causal=False is for KV cache
+                dropout_p=self.attn_dropout_p if self.training else 0)            
         
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
@@ -494,6 +544,9 @@ class Transformer(nn.Module):
             freqs_cis = self.freqs_cis[:token_embeddings.shape[1]]
         else:
             freqs_cis = self.freqs_cis[input_pos]
+        if _env_flag("NAR_USE_FLEX_ATTENTION") and (not self.training) and mask is not None:
+            mask = _dense_mask_to_flex_block_mask(mask)
+
         # transformer blocks
         h, medusa_h = self._run_backbone_and_vertical(h, freqs_cis, input_pos, mask)
         
