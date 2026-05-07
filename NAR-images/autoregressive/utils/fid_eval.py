@@ -81,76 +81,84 @@ def run_fid_eval(
         os.makedirs(sample_dir, exist_ok=True)
     if barrier is not None:
         barrier()
+    os.makedirs(sample_dir, exist_ok=True)
 
     model.eval()
     vq_model.eval()
 
-    latent_size = args.image_size // args.downsample_size
-    per_rank = (args.fid_num_samples + world_size - 1) // world_size
-    start = rank * per_rank
-    end = min(start + per_rank, args.fid_num_samples)
-    local_num = max(0, end - start)
+    try:
+        latent_size = args.image_size // args.downsample_size
+        per_rank = (args.fid_num_samples + world_size - 1) // world_size
+        start = rank * per_rank
+        end = min(start + per_rank, args.fid_num_samples)
+        local_num = max(0, end - start)
 
-    total = 0
-    num_iters = math.ceil(local_num / args.fid_batch_size) if local_num > 0 else 0
-    for _ in range(num_iters):
-        n = min(args.fid_batch_size, local_num - total)
-        if n <= 0:
-            break
-        c_indices = torch.randint(0, args.num_classes, (n,), device=device)
-        qzshape = [n, args.codebook_embed_dim, latent_size, latent_size]
+        if rank == 0:
+            logger.info(
+                f"Running FID eval: samples={args.fid_num_samples}, cfg={args.fid_cfg_scale}, "
+                f"world_size={world_size}, sample_dir={sample_dir}"
+            )
 
-        index_sample = generate_fn(
-            model,
-            c_indices,
-            latent_size ** 2,
-            cfg_scale=args.fid_cfg_scale,
-            cfg_interval=args.fid_cfg_interval,
-            temperature=args.fid_temperature,
-            top_k=args.fid_top_k,
-            top_p=args.fid_top_p,
-            sample_logits=True,
-        )
-        samples = vq_model.decode_code(index_sample, qzshape)
-        if args.image_size_eval != args.image_size:
-            samples = F.interpolate(samples, size=(args.image_size_eval, args.image_size_eval), mode="bicubic")
-        samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1)
-        samples = samples.to("cpu", dtype=torch.uint8).numpy()
+        total = 0
+        num_iters = math.ceil(local_num / args.fid_batch_size) if local_num > 0 else 0
+        for _ in range(num_iters):
+            n = min(args.fid_batch_size, local_num - total)
+            if n <= 0:
+                break
+            c_indices = torch.randint(0, args.num_classes, (n,), device=device)
+            qzshape = [n, args.codebook_embed_dim, latent_size, latent_size]
 
-        from PIL import Image
-        for i, sample in enumerate(samples):
-            Image.fromarray(sample).save(f"{sample_dir}/{start + total + i:06d}.png")
-        total += n
+            index_sample = generate_fn(
+                model,
+                c_indices,
+                latent_size ** 2,
+                cfg_scale=args.fid_cfg_scale,
+                cfg_interval=args.fid_cfg_interval,
+                temperature=args.fid_temperature,
+                top_k=args.fid_top_k,
+                top_p=args.fid_top_p,
+                sample_logits=True,
+            )
+            samples = vq_model.decode_code(index_sample, qzshape)
+            if args.image_size_eval != args.image_size:
+                samples = F.interpolate(samples, size=(args.image_size_eval, args.image_size_eval), mode="bicubic")
+            samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1)
+            samples = samples.to("cpu", dtype=torch.uint8).numpy()
 
-    if barrier is not None:
-        barrier()
+            from PIL import Image
+            for i, sample in enumerate(samples):
+                Image.fromarray(sample).save(f"{sample_dir}/{start + total + i:06d}.png")
+            total += n
 
-    npz_path = None
-    if rank == 0:
-        npz_path = create_npz_from_samples(sample_dir, args.fid_num_samples)
-        logger.info(f"Saved FID samples to {npz_path}")
+        if barrier is not None:
+            barrier()
 
-    txt_path = None
-    metrics = {}
-    if rank == 0:
-        if getattr(args, "fid_skip_evaluator", False):
-            logger.info("Skipping FID evaluator (--fid-skip-evaluator enabled).")
-        else:
-            evaluator_path = os.path.join(_repo_root(), "evaluations", "c2i", "evaluator.py")
-            cmd = ["python3", evaluator_path, args.fid_ref, npz_path]
-            logger.info(f"Running FID evaluator: {' '.join(cmd)}")
-            try:
-                env = os.environ.copy()
-                env["CUDA_VISIBLE_DEVICES"] = "-1"
-                subprocess.run(cmd, check=False, cwd=_repo_root(), env=env)
-                txt_path = npz_path.replace(".npz", ".txt")
-                metrics = _parse_eval_txt(txt_path)
-            except Exception as e:
-                logger.info(f"FID evaluator failed: {e}")
+        npz_path = None
+        if rank == 0:
+            npz_path = create_npz_from_samples(sample_dir, args.fid_num_samples)
+            logger.info(f"Saved FID samples to {npz_path}")
 
-    model.train()
+        txt_path = None
+        metrics = {}
+        if rank == 0:
+            if getattr(args, "fid_skip_evaluator", False):
+                logger.info("Skipping FID evaluator (--fid-skip-evaluator enabled).")
+            else:
+                evaluator_path = os.path.join(_repo_root(), "evaluations", "c2i", "evaluator.py")
+                cmd = ["python3", evaluator_path, args.fid_ref, npz_path]
+                logger.info(f"Running FID evaluator: {' '.join(cmd)}")
+                try:
+                    env = os.environ.copy()
+                    env["CUDA_VISIBLE_DEVICES"] = "-1"
+                    subprocess.run(cmd, check=False, cwd=_repo_root(), env=env)
+                    txt_path = npz_path.replace(".npz", ".txt")
+                    metrics = _parse_eval_txt(txt_path)
+                except Exception as e:
+                    logger.info(f"FID evaluator failed: {e}")
 
-    if rank == 0 and epoch is not None:
-        logger.info(f"FID eval done for epoch={epoch}, step={step}.")
+        if rank == 0 and epoch is not None:
+            logger.info(f"FID eval done for epoch={epoch}, step={step}.")
 
-    return npz_path, txt_path, metrics
+        return npz_path, txt_path, metrics
+    finally:
+        model.train()
